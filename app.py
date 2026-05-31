@@ -550,6 +550,84 @@ _FT_SLOPE_WIDTH = {
 }
 
 
+def build_search_highlight_layer(
+    lids, link_data: dict[str, dict]
+) -> pdk.Layer | None:
+    """검색된 link_id 도로(들)를 형광 노랑으로 하이라이트.
+
+    lids: 단일 문자열 또는 리스트 모두 허용.
+    """
+    if not lids or not link_data:
+        return None
+    if isinstance(lids, str):
+        lid_list = [lids]
+    else:
+        lid_list = list(lids)
+    lid_list = [str(x).strip() for x in lid_list if x]
+
+    paths = []
+    for lid in lid_list:
+        item = link_data.get(lid)
+        if not item:
+            continue
+        coords = item.get("coords", [])
+        if not coords:
+            continue
+        slope = item.get("slope_pct")
+        slope_text = (
+            f"{slope:.1f}%" if isinstance(slope, (int, float)) else "미상"
+        )
+        desc = (
+            f"<b>🔍 선택 도로</b><br/>link_id: {lid}<br/>"
+            f"경사도: {slope_text} ({item.get('slope_level','?')})<br/>"
+            f"길이: {item.get('length_m', '-')} m"
+        )
+        paths.append({"path": coords, "description": desc})
+
+    if not paths:
+        return None
+    return pdk.Layer(
+        "PathLayer",
+        paths,
+        pickable=True,
+        get_path="path",
+        get_color=[255, 255, 0, 255],  # 형광 노랑
+        width_min_pixels=8,
+        width_scale=1,
+    )
+
+
+def compute_view_for_links(
+    lids: list[str], link_data: dict[str, dict]
+) -> tuple[float, float, float]:
+    """선택된 도로들의 bbox 중심 + 자동 zoom 계산.
+
+    반환: (lat, lon, zoom)
+    """
+    import math
+    coords_all: list[list[float]] = []
+    for lid in lids:
+        item = link_data.get(str(lid).strip())
+        if not item:
+            continue
+        coords_all.extend(item.get("coords", []))
+    if not coords_all:
+        return (SEOUL_CENTER[0], SEOUL_CENTER[1], 10.4)
+
+    lons = [c[0] for c in coords_all]
+    lats = [c[1] for c in coords_all]
+    cx, cy = (max(lons) + min(lons)) / 2, (max(lats) + min(lats)) / 2
+
+    # span 큰 쪽 기준 zoom 계산
+    span_lon = max(lons) - min(lons)
+    span_lat = max(lats) - min(lats)
+    span = max(span_lon, span_lat, 1e-5)
+    # log2(360/span) - 1 (패딩)
+    zoom = math.log2(360.0 / span) - 1.5
+    zoom = max(11.0, min(18.0, zoom))
+    return (cy, cx, zoom)
+
+
 def build_foot_traffic_layer(
     agg_df: pd.DataFrame, link_data: dict[str, dict]
 ) -> pdk.Layer | None:
@@ -818,6 +896,16 @@ def render_sidebar(df: pd.DataFrame) -> dict:
         horizontal=False,
     )
 
+    # ── 도로링크 검색 ──
+    st.sidebar.subheader("🔍 도로링크 찾기")
+    search_lid = st.sidebar.text_input(
+        "link_id 입력 후 Enter",
+        value="",
+        placeholder="예: 32731",
+        help="시급도 순위표에서 본 link_id 를 입력하면 지도에서 해당 도로 위치로 자동 줌인 + 형광 강조 표시됩니다.",
+        key="search_lid",
+    )
+
     # ── 유동인구 CSV 업로드 (선택) ──
     st.sidebar.subheader("🚶 유동인구 데이터")
     default_flpop_exists = (DATA_PATH / "flpop.csv").exists()
@@ -838,6 +926,7 @@ def render_sidebar(df: pd.DataFrame) -> dict:
         "satellite_opacity": satellite_opacity,
         "ft_upload": ft_upload,
         "show_foot_traffic_layer": show_foot_traffic_layer,
+        "search_lid": search_lid.strip() if search_lid else "",
         "show_gu_layer": show_gu_layer,
         "show_road_bg": show_road_bg,
         "show_road_layer": show_road_layer,
@@ -922,10 +1011,33 @@ def render_map(df: pd.DataFrame, opts: dict, gu_metrics: pd.DataFrame) -> None:
         if ic is not None:
             layers.append(ic)
 
+    # 강조할 link_id 들 — 다중 또는 단일 모두 동일 흐름으로 처리
+    highlight_lids = opts.get("highlight_lids") or []
+    view_lat, view_lon, view_zoom = SEOUL_CENTER[0], SEOUL_CENTER[1], 10.4
+    if highlight_lids:
+        link_data = _load_road_link_data()
+        # 매칭된 lid만 추림
+        matched = [l for l in highlight_lids if link_data.get(str(l).strip())]
+        if matched:
+            view_lat, view_lon, view_zoom = compute_view_for_links(matched, link_data)
+            hl = build_search_highlight_layer(matched, link_data)
+            if hl is not None:
+                layers.append(hl)
+            if len(matched) < len(highlight_lids):
+                miss = [
+                    str(l) for l in highlight_lids
+                    if not link_data.get(str(l).strip())
+                ]
+                st.warning(f"🔍 link_id 찾을 수 없음: {', '.join(miss)}")
+        else:
+            st.warning(
+                f"🔍 link_id `{', '.join(map(str, highlight_lids))}` 를 찾을 수 없습니다."
+            )
+
     view_state = pdk.ViewState(
-        latitude=SEOUL_CENTER[0],
-        longitude=SEOUL_CENTER[1],
-        zoom=10.4,
+        latitude=view_lat,
+        longitude=view_lon,
+        zoom=view_zoom,
         pitch=0,
         bearing=0,
     )
@@ -1114,6 +1226,57 @@ def _render_urgency_ranking(opts: dict) -> None:
     )
 
     # 표시용 컬럼명/순서 정리
+    # ── 빠른 이동 multiselect ──
+    st.markdown("**🎯 지도로 빠르게 이동 (여러 개 선택 가능)**")
+    top_for_jump = scored.head(int(top_n)).reset_index(drop=True)
+
+    def _fmt_jump_option(idx: int) -> str:
+        r = top_for_jump.iloc[idx]
+        slope = r["slope_pct"]
+        slope_str = f"{slope:.1f}%" if isinstance(slope, (int, float)) else "미상"
+        return (
+            f"#{idx+1}  "
+            f"link_id {r['link_id']}  ·  "
+            f"{r['dong']}  ·  "
+            f"경사 {slope_str}  ·  "
+            f"길이 {int(r['length_m'])}m  ·  "
+            f"시급도 {r['urgency']:.1f}"
+        )
+
+    qb1, qb2, qb3 = st.columns([1, 1, 1])
+    if qb1.button("TOP 5 한번에", use_container_width=True):
+        st.session_state["urgency_jump_multi"] = list(range(min(5, len(top_for_jump))))
+    if qb2.button("TOP 10 한번에", use_container_width=True):
+        st.session_state["urgency_jump_multi"] = list(range(min(10, len(top_for_jump))))
+    if qb3.button("선택 초기화", use_container_width=True):
+        st.session_state["urgency_jump_multi"] = []
+
+    jump_idxs = st.multiselect(
+        "여기서 여러 도로를 선택하면 모두 형광 노랑으로 지도에 표시됩니다",
+        options=list(range(len(top_for_jump))),
+        format_func=_fmt_jump_option,
+        key="urgency_jump_multi",
+    )
+    if jump_idxs:
+        selected_lids = [
+            str(top_for_jump.iloc[i]["link_id"]) for i in jump_idxs
+        ]
+        st.session_state["_jumped_lids"] = selected_lids
+        # 총 길이·유동 합계 표시
+        sub = top_for_jump.iloc[jump_idxs]
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("선택 개수", f"{len(sub)}개")
+        sc2.metric("총 길이", f"{sub['length_m'].sum():,.0f} m")
+        sc3.metric("유동인구 합", f"{sub['flow_sum'].sum():,.0f}")
+    else:
+        st.session_state["_jumped_lids"] = []
+
+    st.caption(
+        "💡 사이드바 **🔍 도로링크 찾기** 에 link_id 를 직접 입력해도 동일하게 작동합니다. "
+        "(다중 선택이 비어있을 때만 사이드바 입력값 사용)"
+    )
+    st.divider()
+
     show = scored.head(int(top_n)).copy()
     show["slope_pct"] = show["slope_pct"].apply(
         lambda v: f"{v:.1f}" if isinstance(v, (int, float)) else "-"
@@ -1578,6 +1741,16 @@ def main() -> None:
 
     # 지도 — 유동인구 도로링크 시각화용 집계 결과를 opts에 합쳐 전달
     opts["ft_link_agg"] = st.session_state.get("ft_link_agg")
+
+    # 다중 선택 결과(시급도 multiselect) 또는 사이드바 단일 검색 통합
+    jumped_lids = st.session_state.get("_jumped_lids", [])
+    if jumped_lids:
+        opts["highlight_lids"] = jumped_lids
+    elif opts.get("search_lid"):
+        opts["highlight_lids"] = [opts["search_lid"]]
+    else:
+        opts["highlight_lids"] = []
+
     st.subheader("🗺️ 지도")
     render_map(df, opts, gu_metrics)
 
