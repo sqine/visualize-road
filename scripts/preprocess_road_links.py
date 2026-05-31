@@ -176,20 +176,48 @@ def main() -> None:
             if lon > bbox[2]: bbox[2] = lon
             if lat > bbox[3]: bbox[3] = lat
 
-        # 경사도 lookup
+        # 경사도 lookup — IDW 보간 + 거리 검증 + 이상값 캡
         elev_s = elev_e = slope = None
         slope_lv = "unknown"
         if elev_idx is not None and len(coords_ll) >= 2:
             lon_s, lat_s = coords_ll[0]
             lon_e, lat_e = coords_ll[-1]
-            h_s, _ = elev_idx.nearest(lon_s, lat_s, max_m=200.0)
-            h_e, _ = elev_idx.nearest(lon_e, lat_e, max_m=200.0)
-            dist_m = _euclid_m(lon_s, lat_s, lon_e, lat_e)
-            if h_s is not None and h_e is not None and dist_m >= 5.0:
-                slope = abs(h_e - h_s) / dist_m * 100.0
-                slope_lv = slope_level(slope)
-                elev_s = round(h_s, 2)
-                elev_e = round(h_e, 2)
+
+            # 실제 path 길이 (직선 아닌 굽힘 반영)
+            dist_m = 0.0
+            for i in range(1, len(coords_ll)):
+                dist_m += _euclid_m(
+                    coords_ll[i-1][0], coords_ll[i-1][1],
+                    coords_ll[i][0], coords_ll[i][1],
+                )
+            if dist_m < 5.0:
+                dist_m = 5.0  # 너무 짧으면 분모 보호
+
+            # 표고 매칭 반경: 도로 길이의 1.5배 (단, 30~150m 범위)
+            search_r = max(30.0, min(150.0, dist_m * 1.5))
+
+            res_s = elev_idx.interpolate(lon_s, lat_s, max_m=search_r, power=2.0)
+            res_e = elev_idx.interpolate(lon_e, lat_e, max_m=search_r, power=2.0)
+            h_s, min_d_s, n_s = res_s
+            h_e, min_d_e, n_e = res_e
+
+            # 신뢰도 조건:
+            #   - 시작·끝점 모두 표고 매칭됐고
+            #   - 가장 가까운 표고 점이 도로 길이의 1.5배 이내 (대략)
+            if (
+                h_s is not None and h_e is not None
+                and min_d_s <= max(search_r, 80.0)
+                and min_d_e <= max(search_r, 80.0)
+            ):
+                raw_slope = abs(h_e - h_s) / dist_m * 100.0
+                # 30% 초과는 한국 도로에서 사실상 없음 → 매칭 오류로 간주
+                if raw_slope > 30.0:
+                    slope_lv = "unknown"
+                else:
+                    slope = raw_slope
+                    slope_lv = slope_level(slope)
+                    elev_s = round(h_s, 2)
+                    elev_e = round(h_e, 2)
         counts[slope_lv] += 1
 
         row = rows[idx]

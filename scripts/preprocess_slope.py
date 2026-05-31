@@ -155,7 +155,6 @@ class GridIndex:
     def nearest(self, lon: float, lat: float, max_m: float = 200.0):
         """가장 가까운 점의 (height, dist_m). 없으면 (None, None)."""
         cx, cy = self._key(lon, lat)
-        # 반경 max_m → 셀 몇 개 검색?
         cells_lon = int(math.ceil(max_m / _M_PER_DEG_LON / self.cell_lon))
         cells_lat = int(math.ceil(max_m / _M_PER_DEG_LAT / self.cell_lat))
         best_d = float("inf")
@@ -173,6 +172,41 @@ class GridIndex:
         if best_h is None or best_d > max_m:
             return None, None
         return best_h, best_d
+
+    def interpolate(self, lon: float, lat: float, max_m: float = 60.0, power: float = 2.0):
+        """반경 max_m 내 표고 점들의 IDW 보간 (역거리 가중 평균).
+
+        도로 양옆의 능선·계곡 표고가 섞여 노이즈가 클 때 단일 최근접보다 안정적.
+        반환: (height, min_dist, n_points). 후보 없으면 (None, None, 0).
+        """
+        cx, cy = self._key(lon, lat)
+        cells_lon = int(math.ceil(max_m / _M_PER_DEG_LON / self.cell_lon))
+        cells_lat = int(math.ceil(max_m / _M_PER_DEG_LAT / self.cell_lat))
+        sum_w = 0.0
+        sum_wh = 0.0
+        min_d = float("inf")
+        n = 0
+        for dx in range(-cells_lon, cells_lon + 1):
+            for dy in range(-cells_lat, cells_lat + 1):
+                ids = self.bins.get((cx + dx, cy + dy))
+                if not ids:
+                    continue
+                for i in ids:
+                    d = _euclid_m(lon, lat, self.lon[i], self.lat[i])
+                    if d > max_m:
+                        continue
+                    if d < 0.5:
+                        # 거의 같은 지점 — 그대로 반환
+                        return self.h[i], d, 1
+                    w = 1.0 / (d ** power)
+                    sum_w += w
+                    sum_wh += w * self.h[i]
+                    if d < min_d:
+                        min_d = d
+                    n += 1
+        if n == 0 or sum_w == 0:
+            return None, None, 0
+        return sum_wh / sum_w, min_d, n
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -248,16 +282,34 @@ def main() -> None:
 
         lon_s, lat_s = coords[0]
         lon_e, lat_e = coords[-1]
-        h_s, d_s = idx.nearest(lon_s, lat_s, max_m=200.0)
-        h_e, d_e = idx.nearest(lon_e, lat_e, max_m=200.0)
-        dist_m = _euclid_m(lon_s, lat_s, lon_e, lat_e)
 
-        if h_s is None or h_e is None or dist_m < 5.0:
-            slope = None
-            lvl = "unknown"
-        else:
-            slope = abs(h_e - h_s) / dist_m * 100.0
-            lvl = slope_level(slope)
+        # 실제 path 길이 (굽힘 반영)
+        dist_m = 0.0
+        for i in range(1, len(coords)):
+            dist_m += _euclid_m(
+                coords[i-1][0], coords[i-1][1],
+                coords[i][0], coords[i][1],
+            )
+        if dist_m < 5.0:
+            dist_m = 5.0
+
+        # IDW 보간 (도로 길이 1.5배 반경, 30~150m 범위)
+        search_r = max(30.0, min(150.0, dist_m * 1.5))
+        h_s, min_d_s, _ = idx.interpolate(lon_s, lat_s, max_m=search_r, power=2.0)
+        h_e, min_d_e, _ = idx.interpolate(lon_e, lat_e, max_m=search_r, power=2.0)
+
+        slope = None
+        lvl = "unknown"
+        if (
+            h_s is not None and h_e is not None
+            and min_d_s <= max(search_r, 80.0)
+            and min_d_e <= max(search_r, 80.0)
+        ):
+            raw = abs(h_e - h_s) / dist_m * 100.0
+            if raw <= 30.0:  # 한국 도로 현실 cap
+                slope = raw
+                lvl = slope_level(slope)
+            # 30% 초과는 매칭 노이즈로 간주 → unknown 유지
         counts[lvl] += 1
 
         feat["properties"].update(

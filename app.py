@@ -103,9 +103,21 @@ def _load_road_features() -> list[dict] | None:
     return load_roads_geojson(DATA_PATH / ROAD_SHAPEFILE)
 
 
+def _path_length_m(coords: list[list[float]]) -> float:
+    """LineString 좌표열 → 총 길이(m). 위경도 → 미터 근사."""
+    from utils.geo import _euclid_m  # 서울 위도 가정 근사
+    if not coords or len(coords) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(coords)):
+        a, b = coords[i - 1], coords[i]
+        total += _euclid_m(a[0], a[1], b[0], b[1])
+    return total
+
+
 @st.cache_data(show_spinner="도로링크(TBGIS) 로드 중...")
 def _load_road_link_data() -> dict[str, dict]:
-    """road_links.geojson 을 {road_lid: {coords, slope_level, slope_pct}} 로 로드.
+    """road_links.geojson 을 {road_lid: {coords, slope_level, slope_pct, length_m}} 로 로드.
 
     파일이 없으면 빈 dict (유동인구 시각화 비활성).
     """
@@ -123,10 +135,12 @@ def _load_road_link_data() -> dict[str, dict]:
         lid = p_.get("road_lid", "")
         if not lid:
             continue
+        coords = feat["geometry"]["coordinates"]
         out[lid] = {
-            "coords": feat["geometry"]["coordinates"],
+            "coords": coords,
             "slope_level": p_.get("slope_level", "unknown"),
             "slope_pct": p_.get("slope_pct"),
+            "length_m": round(_path_length_m(coords), 1),
         }
     return out
 
@@ -453,6 +467,69 @@ def build_slope_layer(
         width_scale=1,
         width_min_pixels=2,
     )
+
+
+# 경사도 등급별 시급도 점수 (0~100)
+_SLOPE_URGENCY_SCORE = {
+    "10_plus": 100.0,
+    "6_10":    70.0,
+    "3_6":     40.0,
+    "0_3":     10.0,
+    "unknown": 20.0,
+}
+
+
+def compute_urgency_scores(
+    agg_df: pd.DataFrame,
+    link_data: dict[str, dict],
+    method: str = "geometric",
+    slope_weight: float = 0.5,
+) -> pd.DataFrame:
+    """도로링크별 시급도 점수 (0~100) + 길이/경사 컬럼 추가.
+
+    method:
+        'geometric'     : √(경사 × 유동)  — 둘 다 높을 때만 큼
+        'weighted_mean' : α·경사 + (1-α)·유동
+        'product'       : 경사 × 유동 / 100  — 극단적
+    slope_weight: weighted_mean 일 때 경사 비중 (0~1)
+    """
+    if agg_df.empty:
+        return agg_df.assign(
+            slope_level=[], slope_pct=[], length_m=[],
+            slope_score=[], flow_score=[], urgency=[],
+        )
+
+    out = agg_df.copy()
+    out["link_id"] = out["link_id"].astype(str)
+    out["slope_level"] = out["link_id"].map(
+        lambda k: link_data.get(k, {}).get("slope_level", "unknown")
+    )
+    out["slope_pct"] = out["link_id"].map(
+        lambda k: link_data.get(k, {}).get("slope_pct")
+    )
+    out["length_m"] = out["link_id"].map(
+        lambda k: link_data.get(k, {}).get("length_m", 0.0)
+    )
+    out["slope_score"] = out["slope_level"].map(_SLOPE_URGENCY_SCORE).fillna(20.0)
+
+    # 유동인구 백분위(0~100) — 같은 필터 내 상대 점수
+    if len(out) > 1:
+        out["flow_score"] = out["flow_sum"].rank(pct=True) * 100.0
+    else:
+        out["flow_score"] = 100.0
+
+    if method == "geometric":
+        out["urgency"] = (out["slope_score"] * out["flow_score"]) ** 0.5
+    elif method == "product":
+        out["urgency"] = out["slope_score"] * out["flow_score"] / 100.0
+    else:  # weighted_mean
+        w = max(0.0, min(1.0, slope_weight))
+        out["urgency"] = out["slope_score"] * w + out["flow_score"] * (1.0 - w)
+
+    out["urgency"] = out["urgency"].round(1)
+    out["slope_score"] = out["slope_score"].round(0).astype(int)
+    out["flow_score"] = out["flow_score"].round(1)
+    return out.sort_values("urgency", ascending=False).reset_index(drop=True)
 
 
 # 경사도 등급별 base RGB (알파는 유동인구로 결정)
@@ -969,6 +1046,137 @@ def render_data_status() -> None:
 # ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
+
+def _render_urgency_ranking(opts: dict) -> None:
+    """시급도 순위 분석 UI.
+
+    유동인구 필터 결과(ft_link_agg) × 도로링크 경사도/길이로 점수 산출.
+    """
+    agg = st.session_state.get("ft_link_agg")
+    if agg is None or agg.empty:
+        st.info(
+            "🚶 **유동인구 분석** 섹션에서 필터를 적용하면 자동으로 활성화됩니다. "
+            "(현재 필터 결과가 비어있음)"
+        )
+        return
+    link_data = _load_road_link_data()
+    if not link_data:
+        st.warning(
+            "`road_links.geojson` 이 없어 경사도·길이 매칭 불가. "
+            "사이드바 데이터 상태에서 추가 데이터 업로드해주세요."
+        )
+        return
+
+    # 산식 선택 UI
+    ccol1, ccol2, ccol3 = st.columns([2, 2, 2])
+    method = ccol1.selectbox(
+        "점수 산식",
+        options=["geometric", "weighted_mean", "product"],
+        index=0,
+        format_func=lambda x: {
+            "geometric": "기하평균 √(경사 × 유동) ⭐ 추천",
+            "weighted_mean": "가중평균",
+            "product": "곱셈 (극단적)",
+        }[x],
+        help=(
+            "**기하평균**: 두 차원 모두 높을 때만 큼. "
+            "**가중평균**: 한 쪽만 높아도 점수 올라감. "
+            "**곱셈**: 한쪽이 낮으면 폭락."
+        ),
+    )
+    slope_weight = 0.5
+    if method == "weighted_mean":
+        slope_weight = ccol2.slider(
+            "경사도 비중",
+            min_value=0.0, max_value=1.0, value=0.5, step=0.1,
+            help="0 = 유동인구만, 1 = 경사도만",
+        )
+    top_n = ccol3.number_input(
+        "상위 N개 표시", min_value=10, max_value=200, value=30, step=10
+    )
+
+    # 점수 계산
+    scored = compute_urgency_scores(agg, link_data, method=method, slope_weight=slope_weight)
+
+    # KPI
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("대상 도로링크", f"{len(scored):,}")
+    k2.metric("평균 시급도", f"{scored['urgency'].mean():.1f}")
+    k3.metric(
+        "총 길이",
+        f"{scored['length_m'].sum()/1000:,.2f} km",
+    )
+    top10_pct = scored.head(int(len(scored) * 0.1) or 1)
+    k4.metric(
+        "상위 10% 평균 길이",
+        f"{top10_pct['length_m'].mean():.0f} m",
+        help="시급도 상위 10% 도로링크의 평균 구간 길이",
+    )
+
+    # 표시용 컬럼명/순서 정리
+    show = scored.head(int(top_n)).copy()
+    show["slope_pct"] = show["slope_pct"].apply(
+        lambda v: f"{v:.1f}" if isinstance(v, (int, float)) else "-"
+    )
+    show["length_m"] = show["length_m"].round(0).astype(int)
+    show["flow_sum"] = show["flow_sum"].round(1)
+    show_disp = show[
+        ["link_id", "gu", "dong", "slope_level", "slope_pct",
+         "length_m", "flow_sum", "slope_score", "flow_score", "urgency"]
+    ].rename(columns={
+        "link_id": "도로링크ID",
+        "gu": "자치구",
+        "dong": "행정동",
+        "slope_level": "경사 등급",
+        "slope_pct": "경사도 %",
+        "length_m": "길이(m)",
+        "flow_sum": "유동인구 합",
+        "slope_score": "경사 점수",
+        "flow_score": "유동 점수",
+        "urgency": "🚨 시급도",
+    })
+    show_disp.insert(0, "순위", range(1, len(show_disp) + 1))
+    st.dataframe(show_disp, use_container_width=True, hide_index=True)
+
+    # 자치구·행정동별 시급도 평균 집계
+    st.markdown("**행정동별 시급도 집계** (구간 길이 가중평균)")
+    gby = (
+        scored.groupby(["gu", "dong"], as_index=False)
+        .apply(
+            lambda g: pd.Series({
+                "구간 수": len(g),
+                "총 길이(km)": round(g["length_m"].sum() / 1000, 2),
+                "평균 시급도": round(g["urgency"].mean(), 1),
+                "길이가중 시급도": round(
+                    (g["urgency"] * g["length_m"]).sum() / max(g["length_m"].sum(), 1),
+                    1,
+                ),
+                "≥10% 구간 수": int((g["slope_level"] == "10_plus").sum()),
+            }),
+            include_groups=False,
+        )
+        .reset_index(drop=False)
+        .sort_values("길이가중 시급도", ascending=False)
+    )
+    if "level_0" in gby.columns:
+        gby = gby.drop(columns=["level_0"])
+    if "level_1" in gby.columns:
+        gby = gby.drop(columns=["level_1"])
+    gby = gby.rename(columns={"gu": "자치구", "dong": "행정동"})
+    st.dataframe(gby, use_container_width=True, hide_index=True)
+
+    # CSV 다운로드
+    csv = scored[
+        ["link_id", "gu", "dong", "slope_level", "slope_pct",
+         "length_m", "flow_sum", "slope_score", "flow_score", "urgency"]
+    ].to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "전체 시급도 순위 CSV 다운로드",
+        data=csv,
+        file_name=f"urgency_ranking_{method}.csv",
+        mime="text/csv",
+    )
+
 
 @st.cache_data(show_spinner=False)
 def _parse_foot_traffic(content_bytes: bytes, file_name: str) -> pd.DataFrame:
@@ -1683,6 +1891,9 @@ def main() -> None:
 
     with st.expander("🚶 유동인구 분석 (피봇 테이블)", expanded=False):
         _render_foot_traffic_section(opts)
+
+    with st.expander("🚨 시급도 순위 (경사도 × 유동인구)", expanded=False):
+        _render_urgency_ranking(opts)
 
     with st.expander("위험도 점수 (placeholder)", expanded=False):
         st.warning(
