@@ -704,6 +704,125 @@ def knee_delta(df: pd.DataFrame, col: str = "감소%_경계통행") -> float | N
     return float(d["δ"].iloc[int(dist.argmax())])
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 예산 × δ 이중 탐색 (발표자료 11쪽 민감도 분석)
+# ══════════════════════════════════════════════════════════════════════
+#: 사전계산 결과 — scripts/run_sensitivity_grid.py 가 만든다
+GRID_FILE = DATA / "sensitivity_grid.parquet"
+GRID_META = DATA / "sensitivity_grid.json"
+GRID_SCRIPT = "scripts/run_sensitivity_grid.py"
+#: 발표의 δ 상한 — 편익(경사위험 방지) 손실 5% 이내
+LOSS_CAP_PCT = 5.0
+
+
+def with_anchor_budgets(grid: list[float], cur_won: float) -> list[float]:
+    """현행 투입액과 그 1.3배를 격자에 정확히 넣고, 바로 옆(0.5% 이내) 격자점은 뺀다."""
+    grid = sorted(set(grid))
+    if cur_won <= 0 or not grid:
+        return grid
+    lo, hi = grid[0], grid[-1]
+    anchors = [x for x in (cur_won, 1.3 * cur_won) if lo <= x <= hi]
+    keep = [g for g in grid if all(abs(g - x) > 0.005 * x for x in anchors)]
+    return sorted(keep + anchors)
+
+
+def grid_signature(ctx: OptContext, region_label: str) -> dict:
+    """사전계산 결과와 앱 설정이 같은 조건인지 비교할 때 쓰는 값."""
+    cfg = ctx.cfg
+    return {
+        "region": region_label,
+        "n_cand": len(ctx.cand),
+        "n_nodes": ctx.G.number_of_nodes(),
+        "h_min": float(cfg.h_min),
+        "cost_per_m": int(round(float(cfg.cost_per_m))),   # 앱 입력은 원 단위 정수
+        "weight_mode": cfg.weight_mode,
+        "msa_iters": int(cfg.msa_iters),
+        "n_src": int(cfg.n_src or 0),
+    }
+
+
+def grid_line(ctx: OptContext, B_won: float, deltas: list[float]) -> list[dict]:
+    """예산 하나에 대해 δ 격자를 푼다 (이중 탐색의 한 줄). δ=0 은 항상 포함."""
+    rows = []
+    for d in sorted({0.0, *map(float, deltas)}):
+        r = solve_budget(ctx, B_won, d)
+        rows.append({
+            "예산억": round(B_won / 1e8, 2), "_B": float(B_won), "δ": d,
+            "선정": r["n"], "연장m": round(r["length_m"]),
+            "경사위험방지": round(r["benefit"], 1), "_ben": float(r["benefit"]),
+            "위험경계": r["boundary"],
+            "전이위험_경계통행": _r1(r["exposure_edge"]),
+            "전이위험_하류통행": round(r["exposure"], 1),
+            "MSA반복": r["msa_iters"], "수렴": r["converged"],
+            "선정링크": json.dumps(sorted(str(n) for n in r["selected"]), ensure_ascii=False),
+        })
+    return rows
+
+
+def grid_finalize(df: pd.DataFrame) -> pd.DataFrame:
+    """예산선마다 δ=0 해를 기준으로 편익 손실%와 전이위험 감소%를 붙인다."""
+    out = []
+    for _, g in df.sort_values(["_B", "δ"]).groupby("_B", sort=True):
+        g = g.copy()
+        b0 = g.loc[g["δ"] == 0]
+        bcol = "_ben" if "_ben" in g.columns else "경사위험방지"   # 반올림 전 값으로 (δ 탐색과 같게)
+        ben0 = float(b0[bcol].iloc[0]) if len(b0) else None
+        g["편익손실%"] = (100 * (1 - g[bcol] / ben0)).round(2) if ben0 else 0.0
+        for col in ("전이위험_경계통행", "전이위험_하류통행"):
+            v0 = float(b0[col].iloc[0]) if len(b0) and pd.notna(b0[col].iloc[0]) else None
+            g[col.replace("전이위험", "감소%")] = (100 * (1 - g[col] / v0)).round(1) if v0 else 0.0
+        out.append(g)
+    return pd.concat(out, ignore_index=True) if out else df
+
+
+def grid_sweep(ctx: OptContext, budgets_won: list[float], deltas: list[float],
+               progress: Callable[[float, str], None] | None = None) -> pd.DataFrame:
+    """예산 격자 × δ 격자 전체를 푼다. 칸 수가 많으면 앱보다 스크립트에서 돌린다."""
+    rows = []
+    n = len(budgets_won)
+    for k, B in enumerate(budgets_won):
+        if progress:
+            progress(k / n, f"예산 {B/1e8:,.2f}억 ({k+1}/{n})")
+        rows += grid_line(ctx, B, deltas)
+    if progress:
+        progress(1.0, "완료")
+    return grid_finalize(pd.DataFrame(rows))
+
+
+def grid_summary(df: pd.DataFrame, col: str = "감소%_경계통행",
+                 loss_cap: float = LOSS_CAP_PCT) -> pd.DataFrame:
+    """예산선별 권장 δ 범위 — 하한 = 파레토 전환점, 상한 = 편익 손실 loss_cap% 이내 최대 δ."""
+    rows = []
+    for B, g in df.groupby("_B", sort=True):
+        knee = knee_delta(g, col)
+        ok = g[g["편익손실%"] <= loss_cap]
+        upper = float(ok["δ"].max()) if len(ok) else None
+        at = g.loc[g["δ"] == knee].iloc[0] if knee is not None else None
+        rows.append({
+            "예산억": round(B / 1e8, 2), "_B": B,
+            "하한δ": knee, "상한δ": upper,
+            "범위성립": (knee is not None and upper is not None and knee <= upper),
+            "전환점_경사위험방지": float(at["경사위험방지"]) if at is not None else None,
+            "전환점_편익손실%": float(at["편익손실%"]) if at is not None else None,
+            "전환점_감소%": float(at[col]) if at is not None else None,
+            "전환점_위험경계": int(at["위험경계"]) if at is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def grid_selection(ctx: OptContext, row: pd.Series) -> set:
+    """저장된 선정링크(문자열)를 그래프 노드로 되돌린다."""
+    lut = {str(n): n for n in ctx.G.nodes()}
+    return {lut[s] for s in json.loads(row["선정링크"]) if s in lut}
+
+
+def load_grid() -> tuple[pd.DataFrame | None, dict | None]:
+    if not GRID_FILE.exists():
+        return None, None
+    meta = json.loads(GRID_META.read_text(encoding="utf-8")) if GRID_META.exists() else {}
+    return pd.read_parquet(GRID_FILE), meta
+
+
 def sweep(ctx: OptContext, budgets_won: list[float],
           progress: Callable[[float, str], None] | None = None) -> pd.DataFrame:
     """예산 격자 × (제안 δ, 기준 δ=0) 스윕. 결과 dict 는 ctx.cache 에 남는다."""

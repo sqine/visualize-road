@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -509,6 +511,162 @@ def _solution_view(ctx, res, res0, B, delta, kp, show_net_default=False):
             key=f"{kp}_dl")
 
 
+REPO = "https://github.com/sqine/visualize-road"
+GRID_KEYS = ("region", "n_cand", "h_min", "cost_per_m", "weight_mode", "msa_iters")
+
+
+@st.cache_data(show_spinner=False)
+def _grid_file(mtime: float):
+    return R.load_grid()
+
+
+def _read_grid_upload(files) -> tuple[pd.DataFrame | None, dict]:
+    df, meta = None, {}
+    for f in files or []:
+        name = f.name.lower()
+        if name.endswith(".json"):
+            meta = json.loads(f.getvalue().decode("utf-8"))
+        elif name.endswith(".parquet"):
+            df = pd.read_parquet(io.BytesIO(f.getvalue()))
+        elif name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(f.getvalue()))
+    return df, meta
+
+
+def _grid_howto():
+    with st.expander("스크립트로 직접 계산하기"):
+        st.markdown(
+            "격자가 크면 앱 밖에서 계산합니다. 저장소를 내려받아 `streamlit_app` 폴더에서 아래 명령을 실행하면 "
+            "`data/` 폴더에 결과 파일(`sensitivity_grid.parquet`), 계산 조건(`.json`), 그림 보고서(`.html`)가 생깁니다. "
+            "보고서는 브라우저로 바로 열리고, parquet 파일은 이 탭의 '파일 올리기'로 올리면 칸을 골라 지도에서 배치를 볼 수 있습니다. "
+            "결과를 `data/`에 둔 채 앱을 실행하거나 저장소에 커밋하면 '사전계산 파일'로 자동으로 읽힙니다.")
+        st.code("python3 scripts/run_sensitivity_grid.py                        # 발표 대상지, 예산 20 × δ 13\n"
+                "python3 scripts/run_sensitivity_grid.py --budgets 60 --jobs 4  # 큰 격자, 4개 프로세스\n"
+                "python3 scripts/run_sensitivity_grid.py --gu 강북구 --dongs 수유1동,수유2동", language="bash")
+        c = st.columns(2)
+        sp = APP_ROOT / R.GRID_SCRIPT
+        if sp.exists():
+            c[0].download_button("스크립트 내려받기", sp.read_bytes(), file_name=sp.name,
+                                 mime="text/x-python", use_container_width=True)
+        c[1].link_button("GitHub에서 보기", f"{REPO}/blob/main/{R.GRID_SCRIPT}", use_container_width=True)
+        st.caption("스크립트는 저장소의 utils/ 모듈을 함께 쓰므로 저장소 전체를 받은 상태에서 실행해야 합니다. "
+                   "앱에서 h_min·설치비·가중치·MSA 반복을 바꿨다면 같은 값을 옵션(--h-min, --cost, --weight, --msa)으로 넘깁니다.")
+
+
+def _grid_tab(ctx, cur, region_label):
+    from utils import sensitivity_viz as V
+    sig = R.grid_signature(ctx, region_label)
+    st.caption("예산과 δ를 함께 바꿔 가며 경사위험 방지와 하류 전이위험의 교환을 봅니다(발표자료 11쪽). "
+               "칸 수가 많아 계산은 스크립트로 미리 하고, 이 탭은 결과를 읽어 그립니다.")
+    src = st.radio("결과 가져오기", ["사전계산 파일", "파일 올리기", "앱에서 작게 계산"], horizontal=True, key="g_src")
+    gdf, gmeta = None, {}
+    if src == "사전계산 파일":
+        if R.GRID_FILE.exists():
+            gdf, gmeta = _grid_file(R.GRID_FILE.stat().st_mtime)
+            gmeta = gmeta or {}
+        else:
+            st.info("`data/sensitivity_grid.parquet`이 없습니다. 아래 안내대로 스크립트를 실행하거나 결과 파일을 올려 주세요.")
+    elif src == "파일 올리기":
+        ups = st.file_uploader("sensitivity_grid.parquet (계산 조건 .json을 함께 올리면 조건을 확인합니다)",
+                               type=["parquet", "json", "csv"], accept_multiple_files=True, key="g_up")
+        gdf, gmeta = _read_grid_upload(ups)
+    else:
+        a = st.columns([1, 2, 1])
+        nb = a[0].number_input("예산 격자 수", 2, 12, 6, key="g_nb")
+        dtx = a[1].text_input("δ 격자", "0, 0.5, 1, 2, 4, 8", key="g_dt")
+        try:
+            dg = sorted({0.0, *(float(v) for v in dtx.replace(" ", "").split(",") if v)})
+        except ValueError:
+            st.error("δ 격자는 숫자를 쉼표로 구분해 적어 주세요."); dg = [0.0, 1.0]
+        base = R.default_budgets(ctx, int(nb))
+        bg = R.with_anchor_budgets([round(float(x), -6) for x in np.linspace(min(base), max(base), int(nb))],
+                                   cur["spent_won"])
+        a[2].metric("칸 수", f"{len(bg) * len(dg)}")
+        gkey = (tuple(sig.items()), tuple(bg), tuple(dg))
+        if st.button("이중 탐색 실행", type="primary", key="run_g",
+                     disabled=st.session_state.get("g_key") == gkey):
+            bar = st.progress(0.0, text="MILP 풀이 중...")
+            st.session_state["g_df"] = R.grid_sweep(ctx, bg, dg, progress=lambda f, t: bar.progress(f, text=t))
+            st.session_state["g_key"] = gkey
+            bar.empty()
+        if st.session_state.get("g_key") == gkey:
+            gdf, gmeta = st.session_state["g_df"], dict(sig)
+        else:
+            st.caption("칸 하나에 약 1초가 걸립니다. 수십 칸을 넘으면 스크립트를 권합니다.")
+    _grid_howto()
+    if gdf is None or not len(gdf):
+        return
+    need = {"_B", "δ", "경사위험방지", "편익손실%", "감소%_경계통행", "선정링크"}
+    if need - set(gdf.columns):
+        st.error("이중 탐색 결과 파일이 아닙니다 (빠진 열: " + ", ".join(sorted(need - set(gdf.columns))) + ").")
+        return
+
+    diff = [k for k in GRID_KEYS if k in gmeta and gmeta[k] != sig[k]]
+    same = bool(gmeta) and not diff
+    if not gmeta:
+        st.warning("계산 조건(.json)이 없어 현재 설정과 같은 조건인지 확인할 수 없습니다. 그림만 표시합니다.")
+    elif diff:
+        st.warning("결과 파일의 계산 조건이 현재 설정과 다릅니다: " +
+                   ", ".join(f"{k} {gmeta[k]} ↔ {sig[k]}" for k in diff) +
+                   ". 그림은 파일 기준이며, 지도 배치는 같은 조건일 때만 표시합니다.")
+    elif gmeta.get("created"):
+        st.caption(f"계산 조건 일치 · {gmeta.get('created')} 계산 · {gmeta.get('cells', len(gdf))}칸")
+
+    metric = st.radio("전이위험 기준", ["경계통행", "하류통행"], horizontal=True, key="g_metric",
+                      format_func={"경계통행": "경계 통행량 × 하류 확률 (발표 정의)",
+                                   "하류통행": "하류 유동인구 × 확률 (발표 10쪽 표)"}.get)
+    ycol = f"감소%_{metric}"
+    summ = R.grid_summary(gdf, ycol)
+    budgets = sorted(gdf["_B"].unique())
+    curB = min(budgets, key=lambda b: abs(b - cur["spent_won"])) if cur["spent_won"] else budgets[len(budgets) // 2]
+    srow = summ.set_index("_B").loc[curB]
+    k = st.columns(4)
+    k[0].metric("격자", f"예산 {len(budgets)} × δ {gdf['δ'].nunique()}")
+    k[1].metric(f"{curB/1e8:,.2f}억 권장 δ 범위",
+                f"{srow['하한δ']:g} ~ {srow['상한δ']:g}" if pd.notna(srow["하한δ"]) and pd.notna(srow["상한δ"]) else "-")
+    k[2].metric("범위가 성립하는 예산선", f"{int(summ['범위성립'].sum())} / {len(summ)}")
+    k[3].metric("전환점 δ 최빈값", f"{summ['하한δ'].mode().iloc[0]:g}" if summ["하한δ"].notna().any() else "-")
+
+    s = st.columns([2, 1.4])
+    B = s[0].select_slider("예산", options=budgets, value=curB, key="g_B",
+                           format_func=lambda x: _budget_label(x, cur))
+    line = gdf[gdf["_B"] == B].sort_values("δ")
+    knee = summ.set_index("_B").at[B, "하한δ"]
+    dopts = list(line["δ"])
+    dv = s[1].select_slider("δ", options=dopts, value=knee if knee in dopts else dopts[0], key="g_d",
+                            format_func=lambda v: f"{v:g}" + (" (전환점)" if v == knee else ""))
+    hm = st.selectbox("히트맵 지표", [ycol, "편익손실%", "경사위험방지", "위험경계", f"전이위험_{metric}"],
+                      format_func=lambda c: V.METRICS.get(c, c), key="g_hm")
+    st.altair_chart(V.heatmap(gdf, summ, hm, sel=(B, dv)), use_container_width=True)
+    st.caption("진한 테두리는 예산선마다의 파레토 전환점(δ 하한), 점선 테두리는 편익 5% 손실 이내 최대 δ(상한), "
+               "흰 점은 아래 지도에 표시한 칸입니다.")
+    c = st.columns(2)
+    c[0].markdown("##### 예산선별 파레토 프런트")
+    c[0].altair_chart(V.fronts(gdf, summ, f"전이위험_{metric}", sel_B=B, height=300), use_container_width=True)
+    c[1].markdown("##### 예산별 권장 δ 범위")
+    c[1].altair_chart(V.band(summ, cur["spent_won"] / 1e8 if cur["spent_won"] else None, height=300),
+                      use_container_width=True)
+    st.caption("왼쪽은 예산이 클수록 진한 선이며 오른쪽 아래로 갈수록 좋은 배치입니다(편익은 크고 전이위험은 작음). "
+               "◆는 각 예산선의 전환점입니다. 오른쪽 띠는 예산마다 고를 만한 δ의 범위입니다.")
+
+    if same:
+        row = line[line["δ"] == dv].iloc[0]
+        row0 = line[line["δ"] == 0].iloc[0]
+        res = R.plan_metrics(ctx, R.grid_selection(ctx, row), B)
+        res.update(delta=float(dv), msa_iters=int(row.get("MSA반복", 0)), converged=bool(row.get("수렴", True)))
+        res0 = R.plan_metrics(ctx, R.grid_selection(ctx, row0), B)
+        res0.update(delta=0.0, msa_iters=0, converged=True)
+        _solution_view(ctx, res, res0, B, float(dv), "g", show_net_default=False)
+    else:
+        st.info("지도 배치는 결과 파일이 현재 지역·설정과 같은 조건으로 계산됐을 때 표시합니다.")
+    with st.expander("격자 표"):
+        show = gdf.drop(columns=["_B", "_ben", "선정링크"], errors="ignore")
+        st.dataframe(show, hide_index=True, use_container_width=True)
+        st.dataframe(summ.drop(columns=["_B"]), hide_index=True, use_container_width=True)
+        st.download_button("격자 CSV 내려받기", show.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="sensitivity_grid.csv", mime="text/csv")
+
+
 def _budget_label(x, cur):
     return (f"{x/1e8:,.2f}억" + (" (현행)" if abs(x - cur["spent_won"]) < 1 else
                                  " (현행+30%)" if abs(x - 1.3 * cur["spent_won"]) < 1 else ""))
@@ -548,7 +706,7 @@ if lvl == 2:
             f"현행 골목 열선 {cur['length_m']:,.0f} m = **{cur['spent_won']/1e8:.2f}억** · "
             f"현행 경계 {cur['boundary']}곳, 하류 전이위험 {R._r1(cur['exposure_edge'])}")
         base_key = (graph_key, h_min, cost, wmode, iters, tlimit, n_src)
-        tb, td = st.tabs(["예산 탐색 (δ 고정)", "δ 탐색 (예산 고정)"])
+        tb, td, tg = st.tabs(["예산 탐색 (δ 고정)", "δ 탐색 (예산 고정)", "이중 탐색 (예산 × δ)"])
 
         # ── 예산 탐색 ───────────────────────────────────────────────
         with tb:
@@ -561,10 +719,7 @@ if lvl == 2:
             bmax = b[2].number_input("예산 상한 (억)", 0.2, 10_000.0, round(dflt[-1] / 1e8, 2), 0.5)
             npts = b[3].number_input("격자 수", 3, 60, 16)
             grid = [round(float(x), -6) for x in np.linspace(bmin * 1e8, bmax * 1e8, int(npts))]
-            if cur["spent_won"] > 0:   # 현행·현행+30% 는 반올림 없이 정확히 넣는다
-                grid += [x for x in (cur["spent_won"], 1.3 * cur["spent_won"])
-                         if bmin * 1e8 <= x <= bmax * 1e8]
-            grid = sorted(set(grid))
+            grid = R.with_anchor_budgets(grid, cur["spent_won"])   # 현행·현행+30% 정확히
             sweep_key = base_key + (float(delta), tuple(grid))
             cached = st.session_state.get("sweep_key") == sweep_key
             if st.button("예산 스윕 실행", type="primary", disabled=cached, key="run_b") or (auto and not cached):
@@ -672,3 +827,7 @@ if lvl == 2:
                                Bd, float(dsel), "d", show_net_default=True)
                 with st.expander("δ별 표"):
                     st.dataframe(ddf, hide_index=True, use_container_width=True)
+
+        # ── 이중 탐색 (예산 × δ) ─────────────────────────────────────
+        with tg:
+            _grid_tab(ctx, cur, R.Region(gu, tuple(dongs), preset).label)

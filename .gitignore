@@ -79,6 +79,10 @@ data/*
 !data/seongbuk_dong.geojson
 # 42KB  - 서대문구 행정동 경계
 !data/seodaemun_dong.geojson
+# 예산 × δ 이중 탐색 사전계산 결과 (scripts/run_sensitivity_grid.py, 약 0.4 MB)
+!data/sensitivity_grid.parquet
+!data/sensitivity_grid.json
+!data/sensitivity_grid.html
 
 # data 안의 하위 폴더는 무시 (slope_raw/, shp/ 등 전처리 입력)
 data/*/
