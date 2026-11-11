@@ -25,6 +25,8 @@ env/
 # ──────────────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
 .env
+.env.*
+!.env.example
 *.log
 
 # ──────────────────────────────────────────────────────────────────────
@@ -51,11 +53,32 @@ env/
 data/*
 
 # 가벼운 필수 데이터 (코드와 함께 배포되어야 함, 총 ~1.5MB)
+# ⚠️ gitignore 는 줄 끝 주석을 지원하지 않는다 — 설명은 반드시 윗줄에 쓸 것
 !data/.gitkeep
-!data/heating_2026.csv      # 50KB  - 열선 설치 현황
-!data/icing_zones.csv       # 564KB - 행정안전부 상습 결빙구간 (서울 필터됨)
-!data/seoul_gu.geojson      # 36KB  - 자치구 25개 경계
-!data/flpop.csv             # 756KB - 도로구간별 추정 유동인구 (기본 샘플)
+# 50KB  - 열선 설치 현황
+!data/heating_2026.csv
+# 564KB - 행정안전부 상습 결빙구간 (서울 필터됨)
+!data/icing_zones.csv
+# 36KB  - 자치구 25개 경계
+!data/seoul_gu.geojson
+# 756KB - 도로구간별 추정 유동인구 (기본 샘플)
+!data/flpop.csv
+
+# 🔥 열선 최적배치 페이지 (pages/) — 총 ~14.6MB
+# 4.4MB - 서울 전역 링크: 열선·경사·표고·도로유형
+!data/seoul_links.parquet
+# 2.7MB - 링크 인접(끝점 5 m 스냅)
+!data/seoul_edges.parquet
+# 6.8MB - 링크 형상(지도)
+!data/seoul_link_geom.parquet
+# 420KB - 성북구 4개동 그래프(정밀 열선 매칭, 발표 재현)
+!data/road_graph.json
+# 108KB - 4개동 링크 중점 표고
+!data/road_graph_nodes_elev.csv
+# 51KB  - 성북구 행정동 경계
+!data/seongbuk_dong.geojson
+# 42KB  - 서대문구 행정동 경계
+!data/seodaemun_dong.geojson
 
 # data 안의 하위 폴더는 무시 (slope_raw/, shp/ 등 전처리 입력)
 data/*/

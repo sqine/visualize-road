@@ -23,6 +23,7 @@ from utils.constants import (
     GU_GEOJSON,
     HEATING_CSV,
     ICING_CSV,
+    ROAD_GRAPH_NODES_CSV,
     ROAD_LINKS_GEOJSON,
     ROAD_SHAPEFILE,
     SEOUL_CENTER,
@@ -48,6 +49,8 @@ from utils.foot_traffic import (
     load_foot_traffic_csv,
     pivot_foot_traffic,
 )
+from utils.delta_lab import render_delta_lab
+from utils.risk import obs_risk
 from utils.data_loader import (
     aggregate_by_gu,
     aggregate_by_road,
@@ -56,13 +59,17 @@ from utils.data_loader import (
     load_icing_csv,
 )
 from utils.geo import (
+    ROAD_TYPE_COLORS,
+    ROAD_TYPE_LABELS,
+    ROAD_TYPE_LEVELS,
     SLOPE_COLORS,
     SLOPE_LABELS,
-    SLOPE_LEVELS,
     build_gu_polygon_index,
     fallback_points,
     filter_icing_to_seoul,
+    filter_roads_by_road_type,
     filter_roads_by_slope,
+    highway_to_road_type,
     load_gu_geojson,
     load_roads_geojson,
     match_roads,
@@ -76,12 +83,45 @@ from utils.geo import (
 
 st.set_page_config(
     page_title="서울시 도로 열선 분석",
-    page_icon="🛣️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 DATA_PATH = Path(__file__).parent / DATA_DIR
+
+#: 위험군 경사(%) — 「장애인등편의법 시행규칙」 별표1 접근로 기울기 1/18 (발표자료 2쪽)
+STEEP_PCT = 100 / 18
+
+
+def _risk_rgba(p: float | None, alpha: int = 220) -> list[int]:
+    """미끄러짐 확률 P(MAA<θ) 0~1 → 연노랑→진빨강. 미상은 회색."""
+    if p is None or p != p:
+        return [160, 160, 160, 90]
+    p = max(0.0, min(1.0, float(p)))
+    stops = [(0.0, (253, 231, 179)), (0.4, (247, 160, 90)),
+             (0.7, (220, 75, 50)), (1.0, (130, 20, 30))]
+    for (a, ca), (b, cb) in zip(stops, stops[1:]):
+        if p <= b:
+            t = (p - a) / (b - a)
+            return [int(ca[k] + t * (cb[k] - ca[k])) for k in range(3)] + [alpha]
+    return list(stops[-1][1]) + [alpha]
+
+
+@st.cache_data(show_spinner="1:1,000 경사 링크 통계 계산 중...")
+def _load_link_risk_stats() -> pd.DataFrame | None:
+    """seoul_links.parquet(1:1,000 경사·열선·결빙) → 골목길 링크별 위험 지표.
+
+    발표자료와 같은 정의: 위험군 = 경사 ≥5.56%, 위험도 = P(MAA<θ)(WinterLab EDF).
+    """
+    p = DATA_PATH / "seoul_links.parquet"
+    if not p.exists():
+        return None
+    L = pd.read_parquet(p, columns=["gu", "slope_pct", "road_type", "dist_m", "heat", "icing"])
+    L = L[L.gu.notna()].copy()
+    L["len"] = L.dist_m.fillna(0.0)
+    L["risk"] = [obs_risk(v) if v == v else None for v in L.slope_pct]
+    L["steep"] = L.slope_pct >= STEEP_PCT
+    return L
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -141,8 +181,84 @@ def _load_road_link_data() -> dict[str, dict]:
             "slope_level": p_.get("slope_level", "unknown"),
             "slope_pct": p_.get("slope_pct"),
             "length_m": round(_path_length_m(coords), 1),
+            # scripts/classify_road_type.py 가 부여 (없으면 미분류로 취급)
+            "road_type": p_.get("road_type", "unknown"),
+            "road_type_highway": p_.get("road_type_highway", ""),
+            "road_type_match_dist_m": p_.get("road_type_match_dist_m"),
+            # 2026-09-13 1:1,000 정밀 경사도 확보 여부 (preprocess_slope_1000*.py)
+            "source_1000": bool(p_.get("source_1000")),
+            "slope1000_method": p_.get("slope1000_method", ""),
         }
     return out
+
+
+@st.cache_data(show_spinner="골목길 경사도 데이터 로드 중...")
+def _load_golmok_paths() -> list[dict]:
+    """road_links.geojson 중 road_type == '골목길' 인 링크만 지도용 path로 변환.
+
+    _load_road_link_data() 는 link_id 키 dict라 지도 레이어 구성 시 매번 순회해야
+    하므로, 골목길만 뽑은 얕은 리스트를 따로 캐싱 — '골목길 경사도' /
+    '경사도 정밀도 갱신 현황' 두 레이어가 공유해서 씀.
+    각 항목: road_lid, path, slope_level, slope_pct, source_1000(1:1,000 확보 여부),
+    slope1000_method(TIN_local/IDW_fallback/혼합), elev_start_m, elev_end_m.
+    """
+    p = DATA_PATH / ROAD_LINKS_GEOJSON
+    if not p.exists():
+        return []
+    import json
+    with p.open("r", encoding="utf-8") as f:
+        gj = json.load(f)
+    out: list[dict] = []
+    for feat in gj.get("features", []):
+        props = feat.get("properties", {})
+        if props.get("road_type") != "골목길":
+            continue
+        geom = feat.get("geometry", {})
+        if geom.get("type") != "LineString":
+            continue
+        coords = geom.get("coordinates", [])
+        if not coords:
+            continue
+        out.append(
+            {
+                "road_lid": props.get("road_lid", ""),
+                "path": coords,
+                "slope_level": props.get("slope_level", "unknown"),
+                "slope_pct": props.get("slope_pct"),
+                "source_1000": bool(props.get("source_1000")),
+                "slope1000_method": props.get("slope1000_method", ""),
+                "elev_start_m": props.get("elev_start_m"),
+                "elev_end_m": props.get("elev_end_m"),
+            }
+        )
+    return out
+
+
+@st.cache_data(show_spinner="4개동 후보 링크 로드 중...")
+def _load_tier_risk_nodes() -> pd.DataFrame:
+    """road_graph.json(성북구 4개동 1,190개) — 열선 사각지대 레이어용.
+
+    위험군 = 경사 ≥5.56%(발표자료 기준). 지표온도(LST) 기반 지형/노출위험
+    분류는 발표 모형에서 제외(7쪽: 기온·일사량은 골목 간 차이를 설명 못함)되어
+    레이어에서도 뺐다.
+    """
+    import json
+    p = DATA_PATH / "road_graph.json"     # 정밀 열선 매칭(heating_installed_precise) 포함
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.DataFrame(json.load(open(p, encoding="utf-8"))["nodes"])
+    df = df.rename(columns={"id": "_id"})
+    df["flow_sum"] = df["flow_sum"].fillna(0.0)
+    valid = df[df["slope_pct"].notna()].copy()
+    if valid.empty:
+        return valid
+    valid["risk"] = valid["slope_pct"].map(obs_risk)
+    valid["steep_golmok_no_heat"] = (
+        (valid["road_type"] == "골목길")
+        & (valid["slope_pct"] >= STEEP_PCT)
+        & (valid["heating_installed_precise"] == False)  # noqa: E712
+    )
+    return valid
 
 
 @st.cache_data(show_spinner="결빙구간 OSM 스냅 중...")
@@ -272,7 +388,9 @@ def build_gu_choropleth_layer(gj: dict, gu_metrics: pd.DataFrame, metric_col: st
             f"<b>{gu_name}</b><br/>"
             f"도로 수: {_fmt_int(m.get('road_count'))} 건<br/>"
             f"총 연장: {_fmt_int(m.get('total_length_m'))} m<br/>"
-            f"구간 평균: {_fmt_int(m.get('avg_length_m'))} m"
+            f"구간 평균: {_fmt_int(m.get('avg_length_m'))} m<br/>"
+            f"위험군 골목길: {m.get('steep_km', 0) or 0:,.1f} km · "
+            f"열선 커버리지 {m.get('steep_cov_pct', 0) or 0:.1f}%"
         )
 
         for poly_rings in polys:
@@ -411,16 +529,18 @@ def build_road_line_layer(road_lines) -> pdk.Layer:
     )
 
 
-def build_slope_layer(
+def build_road_type_layer(
     features_by_gu: dict[str, list[dict]],
     selected_gus: list[str],
-    selected_levels: list[str],
+    selected_types: list[str],
 ) -> pdk.Layer | None:
-    """경사도 등급별 색상 도로 레이어.
+    """도로유형(골목길/애매/대형도로/미분류)별 색상 도로 레이어.
 
-    각 도로의 slope_level 속성으로 색상 결정. SLOPE_COLORS 매핑 사용.
+    OSM highway 태그를 기준으로 분류(utils.geo.highway_to_road_type).
+    시급도 후보 산출 시 '대형도로'는 기본 제외되므로, 이 레이어로 제외 대상을
+    지도에서 미리 눈으로 확인할 수 있다.
     """
-    feats = filter_roads_by_slope(features_by_gu, selected_gus, selected_levels)
+    feats = filter_roads_by_road_type(features_by_gu, selected_gus, selected_types)
     if not feats:
         return None
 
@@ -430,28 +550,17 @@ def build_slope_layer(
         coords = feat.get("geometry", {}).get("coordinates", [])
         if not coords:
             continue
-        lvl = props.get("slope_level", "unknown")
-        slope = props.get("slope_pct")
-        slope_text = (
-            f"{slope:.1f} %" if isinstance(slope, (int, float)) else "미상"
-        )
-        es = props.get("elev_start_m")
-        ee = props.get("elev_end_m")
-        elev_text = (
-            f"{es} m → {ee} m"
-            if es is not None and ee is not None
-            else "표고 매칭 실패"
-        )
+        hw = props.get("highway", "")
+        rt = highway_to_road_type(hw)
         paths.append(
             {
                 "path": coords,
-                "color": SLOPE_COLORS.get(lvl, SLOPE_COLORS["unknown"]),
+                "color": ROAD_TYPE_COLORS.get(rt, ROAD_TYPE_COLORS["unknown"]),
                 "description": (
                     f"<b>{props.get('road_name','(이름 없음)')}</b>"
                     f"<br/>자치구: {props.get('gu','')}"
-                    f"<br/>경사도: {slope_text} ({SLOPE_LABELS.get(lvl, lvl)})"
-                    f"<br/>표고: {elev_text}"
-                    f"<br/>거리: {props.get('dist_m','-')} m"
+                    f"<br/>도로유형: {ROAD_TYPE_LABELS.get(rt, rt)}"
+                    f"<br/>OSM highway: {hw or '(태그 없음)'}"
                 ),
             }
         )
@@ -469,85 +578,86 @@ def build_slope_layer(
     )
 
 
-# 경사도 등급별 시급도 점수 (0~100)
-_SLOPE_URGENCY_SCORE = {
-    "10_plus": 100.0,
-    "6_10":    70.0,
-    "3_6":     40.0,
-    "0_3":     10.0,
-    "unknown": 20.0,
-}
+def build_golmok_slope_layer(
+    golmok_paths: list[dict],
+    steep_only: bool = True,
+) -> pdk.Layer | None:
+    """골목길(TBGIS road_links.geojson) 미끄러짐 위험 레이어.
+
+    경사는 수치지형도 1:1,000 기반. 색은 경사 등급이 아니라 발표 모형의
+    위험도 P(MAA<θ)(WinterLab 빙판 실측 MAA 경험분포)로 칠한다.
+    steep_only=True 면 위험군(경사 ≥5.56%)만 그린다(서울 전역 14만 링크 부담 완화).
+    """
+    paths = []
+    for item in golmok_paths:
+        slope = item["slope_pct"]
+        if not isinstance(slope, (int, float)):
+            continue
+        if steep_only and slope < STEEP_PCT:
+            continue
+        r = obs_risk(slope)
+        es, ee = item.get("elev_start_m"), item.get("elev_end_m")
+        elev_text = f"{es} m → {ee} m" if es is not None and ee is not None else "-"
+        paths.append(
+            {
+                "path": item["path"],
+                "color": _risk_rgba(r),
+                "description": (
+                    f"<b>골목길 링크 {item['road_lid']}</b>"
+                    f"<br/>경사도: {slope:.1f}%{' (위험군)' if slope >= STEEP_PCT else ''}"
+                    f"<br/>미끄러짐 확률 P(MAA<θ): {r:.2f}"
+                    f"<br/>표고: {elev_text}"
+                ),
+            }
+        )
+    if not paths:
+        return None
+    return pdk.Layer(
+        "PathLayer",
+        paths,
+        pickable=True,
+        get_path="path",
+        get_color="color",
+        width_scale=1,
+        width_min_pixels=2,
+    )
+
+
+# 최적화/시급도 후보에서 기본 제외할 도로유형 — 대형도로는 열선 설치 대상이 아님
+DEFAULT_EXCLUDED_ROAD_TYPES = frozenset({"대형도로"})
 
 
 def compute_urgency_scores(
     agg_df: pd.DataFrame,
     link_data: dict[str, dict],
-    method: str = "geometric",
-    slope_weight: float = 0.5,
+    exclude_road_types: frozenset[str] | set[str] = DEFAULT_EXCLUDED_ROAD_TYPES,
 ) -> pd.DataFrame:
-    """도로링크별 시급도 점수 (0~100) + 길이/경사 컬럼 추가.
+    """도로링크별 기대 미끄러짐 건수 = P(MAA<θ) × 유동인구 (발표자료 7~8쪽).
 
-    method:
-        'geometric'     : √(경사 × 유동)  — 둘 다 높을 때만 큼
-        'weighted_mean' : α·경사 + (1-α)·유동
-        'product'       : 경사 × 유동 / 100  — 극단적
-    slope_weight: weighted_mean 일 때 경사 비중 (0~1)
+    경사를 등급 점수로 바꿔 유동인구 백분위와 섞던 이전 방식(임의 가중치)을
+    버리고, 실측 MAA 경험분포에서 나온 확률을 그대로 곱한다. 단위가 '건'이라
+    링크 간·지역 간 합산과 비교가 가능하다. urgency 컬럼 = expected_slips.
     """
+    cols = ["slope_pct", "length_m", "road_type", "risk", "expected_slips", "urgency"]
     if agg_df.empty:
-        return agg_df.assign(
-            slope_level=[], slope_pct=[], length_m=[],
-            slope_score=[], flow_score=[], urgency=[],
-        )
+        return agg_df.assign(**{c: [] for c in cols})
 
     out = agg_df.copy()
     out["link_id"] = out["link_id"].astype(str)
-    out["slope_level"] = out["link_id"].map(
-        lambda k: link_data.get(k, {}).get("slope_level", "unknown")
-    )
-    out["slope_pct"] = out["link_id"].map(
-        lambda k: link_data.get(k, {}).get("slope_pct")
-    )
-    out["length_m"] = out["link_id"].map(
-        lambda k: link_data.get(k, {}).get("length_m", 0.0)
-    )
-    out["slope_score"] = out["slope_level"].map(_SLOPE_URGENCY_SCORE).fillna(20.0)
+    out["slope_pct"] = out["link_id"].map(lambda k: link_data.get(k, {}).get("slope_pct"))
+    out["length_m"] = out["link_id"].map(lambda k: link_data.get(k, {}).get("length_m", 0.0))
+    out["road_type"] = out["link_id"].map(
+        lambda k: link_data.get(k, {}).get("road_type", "unknown"))
 
-    # 유동인구 백분위(0~100) — 같은 필터 내 상대 점수
-    if len(out) > 1:
-        out["flow_score"] = out["flow_sum"].rank(pct=True) * 100.0
-    else:
-        out["flow_score"] = 100.0
+    if exclude_road_types:
+        out = out[~out["road_type"].isin(exclude_road_types)].reset_index(drop=True)
+    if out.empty:
+        return out.assign(risk=[], expected_slips=[], urgency=[])
 
-    if method == "geometric":
-        out["urgency"] = (out["slope_score"] * out["flow_score"]) ** 0.5
-    elif method == "product":
-        out["urgency"] = out["slope_score"] * out["flow_score"] / 100.0
-    else:  # weighted_mean
-        w = max(0.0, min(1.0, slope_weight))
-        out["urgency"] = out["slope_score"] * w + out["flow_score"] * (1.0 - w)
-
-    out["urgency"] = out["urgency"].round(1)
-    out["slope_score"] = out["slope_score"].round(0).astype(int)
-    out["flow_score"] = out["flow_score"].round(1)
-    return out.sort_values("urgency", ascending=False).reset_index(drop=True)
-
-
-# 경사도 등급별 base RGB (알파는 유동인구로 결정)
-_FT_SLOPE_BASE_RGB = {
-    "10_plus": [220, 30, 30],   # 빨강 — 매우 위험
-    "6_10":    [240, 130, 40],  # 주황 — 위험
-    "3_6":     [255, 210, 80],  # 노랑 — 보통
-    "0_3":     [150, 150, 160], # 회색 — 평탄
-    "unknown": [140, 140, 140], # 회색
-}
-# 경사도 등급별 두께 가중치 (위험 등급일수록 굵게)
-_FT_SLOPE_WIDTH = {
-    "10_plus": 5.0,
-    "6_10":    4.0,
-    "3_6":     2.8,
-    "0_3":     2.0,
-    "unknown": 2.0,
-}
+    out["risk"] = out["slope_pct"].map(obs_risk).round(3)
+    out["expected_slips"] = (out["risk"] * out["flow_sum"]).round(2)
+    out["urgency"] = out["expected_slips"]
+    return out.sort_values("expected_slips", ascending=False).reset_index(drop=True)
 
 
 def build_search_highlight_layer(
@@ -578,7 +688,7 @@ def build_search_highlight_layer(
             f"{slope:.1f}%" if isinstance(slope, (int, float)) else "미상"
         )
         desc = (
-            f"<b>🔍 선택 도로</b><br/>link_id: {lid}<br/>"
+            f"<b>선택 도로</b><br/>link_id: {lid}<br/>"
             f"경사도: {slope_text} ({item.get('slope_level','?')})<br/>"
             f"길이: {item.get('length_m', '-')} m"
         )
@@ -631,76 +741,48 @@ def compute_view_for_links(
 def build_foot_traffic_layer(
     agg_df: pd.DataFrame, link_data: dict[str, dict]
 ) -> pdk.Layer | None:
-    """유동인구 × 경사도 조합 PathLayer.
+    """기대 미끄러짐 = P(MAA<θ) × 유동인구 PathLayer.
 
-    색상 (hue) = 경사도 등급 (≥10% 빨강, 6-10% 주황, 3-6% 노랑, 그외 회색)
-    투명도 (alpha) = 유동인구 분위수 (50 → 255)
-    두께 = 경사도 등급별 base × 유동인구 분위수 가중치
-
-    이렇게 하면 "빨강+진함" = 가파른 곳 + 유동인구 많음 = 최우선 열선 설치 대상.
+    색 = 기대 미끄러짐(상위 2% 값으로 정규화한 연노랑→진빨강), 굵기도 같은 값.
+    경사 등급 색 × 유동인구 투명도로 두 축을 눈으로 섞던 방식 대신, 발표 모형의
+    목적함수 계수(risk_i·flow_i)를 그대로 보여준다.
     """
     if agg_df.empty or not link_data:
         return None
-
-    vals = agg_df["flow_sum"].astype(float)
-    if vals.max() <= 0:
-        return None
-
-    # 유동인구 분위수 → alpha (20%~100% 범위)
-    qs = vals.quantile([0.25, 0.5, 0.75, 0.9]).to_dict()
-    q25 = qs.get(0.25, 0)
-    q50 = qs.get(0.5, 0)
-    q75 = qs.get(0.75, 0)
-    q90 = qs.get(0.9, 0)
-
-    def alpha_for(v: float) -> int:
-        # 20% → 100%
-        if v <= q25: return 50    # 20%
-        if v <= q50: return 100   # 40%
-        if v <= q75: return 160   # 63%
-        if v <= q90: return 210   # 82%
-        return 255                # 100%
-
-    def width_for(slope_lv: str, v: float) -> float:
-        base = _FT_SLOPE_WIDTH.get(slope_lv, 2.0)
-        # 유동인구 많을수록 약간 더 굵게 (+0~+1.5)
-        bonus = 0.0
-        if v > q75: bonus = 0.7
-        if v > q90: bonus = 1.5
-        return base + bonus
-
-    paths = []
-    skipped_no_match = 0
+    rows = []
     for _, row in agg_df.iterrows():
         lid = str(row["link_id"])
         link = link_data.get(lid)
         if not link:
-            skipped_no_match += 1
             continue
+        s = link.get("slope_pct")
+        r = obs_risk(s) if isinstance(s, (int, float)) else None
         v = float(row["flow_sum"])
-        slope_lv = link.get("slope_level", "unknown") or "unknown"
-        rgb = _FT_SLOPE_BASE_RGB.get(slope_lv, _FT_SLOPE_BASE_RGB["unknown"])
-        alpha = alpha_for(v)
-        slope_pct = link.get("slope_pct")
-        slope_text = (
-            f"{slope_pct:.1f}%" if isinstance(slope_pct, (int, float)) else "미상"
-        )
+        rows.append((lid, link, s, r, v, (r or 0.0) * v, row))
+    if not rows:
+        return None
+    ev = pd.Series([x[5] for x in rows])
+    top = float(ev.quantile(0.98)) or float(ev.max()) or 1.0
+
+    paths = []
+    for lid, link, s, r, v, e, row in rows:
+        k = min(e / top, 1.0)
+        slope_text = f"{s:.1f}%" if isinstance(s, (int, float)) else "미상"
+        risk_text = f"{r:.2f}" if r is not None else "-"
         paths.append(
             {
                 "path": link["coords"],
-                "color": [rgb[0], rgb[1], rgb[2], alpha],
-                "width": width_for(slope_lv, v),
+                "color": _risk_rgba(k, alpha=int(70 + 185 * k)),
+                "width": 2.0 + 4.0 * k,
                 "description": (
-                    f"<b>유동인구: {v:,.1f}</b>"
-                    f"<br/>경사도: {slope_text} ({slope_lv})"
+                    f"<b>기대 미끄러짐: {e:,.1f}건</b>"
+                    f"<br/>미끄러짐 확률 P(MAA<θ): {risk_text} (경사 {slope_text})"
+                    f"<br/>유동인구: {v:,.1f}"
                     f"<br/>link_id: {lid}"
                     f"<br/>행정동: {row.get('dong','')} ({row.get('gu','')})"
                 ),
             }
         )
-
-    if not paths:
-        return None
     return pdk.Layer(
         "PathLayer",
         paths,
@@ -797,12 +879,50 @@ def build_road_point_layer(points_df: pd.DataFrame) -> pdk.Layer:
     )
 
 
+def _tier_description(r: pd.Series, tag: str) -> str:
+    return (
+        f"<b>{tag}</b> — link {r['link_id']} ({r['dong']})"
+        f"<br/>경사도: {r['slope_pct']:.2f}% · 미끄러짐 확률 P(MAA<θ) {r['risk']:.2f}"
+        f"<br/>유동인구: {r['flow_sum']:.1f} · 기대 미끄러짐 {r['risk'] * r['flow_sum']:.1f}건"
+        f"<br/>공식 결빙취약구역: {'예' if r['icing'] else '아니오'}"
+        f"<br/>열선설치(정밀): {'예' if r['heating_installed_precise'] else '아니오'}"
+    )
+
+
+def build_heating_gap_layer(nodes: pd.DataFrame) -> pdk.Layer | None:
+    """위험군(경사 ≥5.56%) 골목길인데 열선(정밀 클리핑 기준) 미설치인 사각지대.
+
+    검은 테두리 + 진한 빨강 채움 — 3장/그림 3-3에서 강조한, 공식 지정에도
+    현재 열선 우선순위에도 거의 포착되지 않는 실질적 표적 구간.
+    """
+    sub = nodes[nodes["steep_golmok_no_heat"]]
+    if sub.empty:
+        return None
+    rows = [
+        {"lat": r["lat"], "lon": r["lon"],
+         "description": _tier_description(r, "위험군 골목길·열선 미설치")}
+        for _, r in sub.iterrows()
+    ]
+    return pdk.Layer(
+        "ScatterplotLayer",
+        pd.DataFrame(rows),
+        pickable=True,
+        get_position="[lon, lat]",
+        get_radius=7,
+        radius_units='"pixels"',
+        get_fill_color=[165, 15, 21, 230],
+        stroked=True,
+        get_line_color=[0, 0, 0],
+        line_width_min_pixels=1.5,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────
 
 def render_sidebar(df: pd.DataFrame) -> dict:
-    st.sidebar.title("⚙️ 필터 & 레이어")
+    st.sidebar.title("필터 & 레이어")
 
     st.sidebar.subheader("배경 지도")
     show_satellite = st.sidebar.checkbox(
@@ -836,33 +956,47 @@ def render_sidebar(df: pd.DataFrame) -> dict:
         value=True,
         help="행정안전부 상습 결빙구간 데이터 중 서울 자치구 내부에 있는 구간만 표시.",
     )
-    show_foot_traffic_layer = st.sidebar.checkbox(
-        "유동인구 × 경사도 (TBGIS 도로링크)",
+    show_heating_gap_layer = st.sidebar.checkbox(
+        "위험군 골목길 & 열선 미설치 (사각지대)",
         value=False,
-        help=(
-            "유동인구 CSV 업로드 시 활성. 도로 **색상=경사도** "
-            "(≥10% 빨강 / 6-10% 주황 / 3-6% 노랑 / 그외 회색), "
-            "**투명도=유동인구 분위수** (적음 옅음 → 많음 진함). "
-            "빨강+진함 = 가파르고 유동인구 많은 최우선 열선 설치 대상."
-        ),
+        help="경사 5.56% 이상(위험군) 골목길인데 VWorld 정밀 클리핑 기준 열선이 "
+        "설치되지 않은 구간(성북구 4개동). 검은 테두리 진한 빨강.",
     )
-    show_slope_layer = st.sidebar.checkbox(
-        "경사도 도로 (등급별 색상)",
+    show_foot_traffic_layer = st.sidebar.checkbox(
+        "기대 미끄러짐 = P(MAA<θ) × 유동인구",
         value=False,
-        help="도로 시작/끝점 표고로 산출한 경사도를 등급별 색상으로 표시. "
-        "전체 도로 배경 레이어 대신 등급 색상 레이어가 표시됩니다.",
+        help="발표 모형의 목적함수 계수(risk_i·flow_i). 미끄러짐 확률은 WinterLab "
+        "빙판 보행 실측 MAA 경험분포. 색·굵기 = 기대 미끄러짐 건수. "
+        "유동인구 분석 섹션의 필터(기본: 평일 06~11시)를 따른다.",
+    )
+    show_road_type_layer = st.sidebar.checkbox(
+        "도로유형 (골목길/대형도로, 색상)",
+        value=False,
+        help="OSM highway 태그 기준 분류. 초록=골목길(residential/living_street/"
+        "unclassified) · 노랑=애매(tertiary) · 파랑=대형도로(primary/secondary/"
+        "trunk/motorway 등) · 회색=미분류. 기대 미끄러짐 순위에서는 대형도로가 기본 "
+        "제외됩니다.",
+    )
+    show_golmok_slope_layer = st.sidebar.checkbox(
+        "골목길 미끄러짐 위험 P(MAA<θ)",
+        value=False,
+        help="수치지형도 1:1,000 경사를 WinterLab 실측 MAA 경험분포로 미끄러짐 "
+        "확률로 바꿔 칠한다(연노랑 0 → 진빨강 1, 경사 21.3% 이상 포화).",
+    )
+    steep_only = st.sidebar.checkbox(
+        "　└ 위험군(경사 ≥5.56%)만",
+        value=True,
+        disabled=not show_golmok_slope_layer,
+        help="끄면 서울 골목길 14만 링크를 모두 그려 느려질 수 있다.",
     )
 
-    st.sidebar.subheader("경사도 필터")
-    slope_options = list(SLOPE_LEVELS)
-    # 기본값: 6% 이상만 켜기 (사용자가 결빙 위험과 연관해 보고싶어 함)
-    default_levels = ["6_10", "10_plus"]
-    selected_levels = st.sidebar.multiselect(
-        "경사도 등급",
-        options=slope_options,
-        default=default_levels,
-        format_func=lambda x: SLOPE_LABELS[x],
-        help="6% 이상은 결빙 시 위험이 급증하는 구간으로 알려져 있음.",
+    st.sidebar.subheader("도로유형 필터")
+    selected_road_types = st.sidebar.multiselect(
+        "도로유형 (도로유형 레이어용)",
+        options=list(ROAD_TYPE_LEVELS),
+        default=list(ROAD_TYPE_LEVELS),
+        format_func=lambda x: ROAD_TYPE_LABELS.get(x, x),
+        help="'도로유형' 레이어를 켰을 때 지도에 표시할 유형만 선택.",
     )
 
     st.sidebar.subheader("필터")
@@ -890,27 +1024,28 @@ def render_sidebar(df: pd.DataFrame) -> dict:
         options=[
             ("total_length_m", "총 연장(m)"),
             ("road_count", "도로 수"),
-            ("risk_score", "위험도 점수(임시)"),
+            ("steep_km", "위험군 골목길 연장(km)"),
+            ("steep_cov_pct", "위험군 열선 커버리지(%)"),
         ],
         format_func=lambda x: x[1],
         horizontal=False,
     )
 
     # ── 도로링크 검색 ──
-    st.sidebar.subheader("🔍 도로링크 찾기")
+    st.sidebar.subheader("도로링크 찾기")
     search_lid = st.sidebar.text_input(
         "link_id 입력 후 Enter",
         value="",
         placeholder="예: 32731",
-        help="시급도 순위표에서 본 link_id 를 입력하면 지도에서 해당 도로 위치로 자동 줌인 + 형광 강조 표시됩니다.",
+        help="기대 미끄러짐 순위표에서 본 link_id 를 입력하면 지도에서 해당 도로 위치로 자동 줌인 + 형광 강조 표시됩니다.",
         key="search_lid",
     )
 
     # ── 유동인구 CSV 업로드 (선택) ──
-    st.sidebar.subheader("🚶 유동인구 데이터")
+    st.sidebar.subheader("유동인구 데이터")
     default_flpop_exists = (DATA_PATH / "flpop.csv").exists()
     if default_flpop_exists:
-        st.sidebar.caption("✅ 기본 `flpop.csv` 자동 로드됨. 다른 파일로 분석하려면 업로드:")
+        st.sidebar.caption("기본 `flpop.csv` 자동 로드됨. 다른 파일로 분석하려면 업로드:")
     ft_upload = st.sidebar.file_uploader(
         "도로구간별 추정 유동인구 CSV (선택)" if default_flpop_exists
         else "도로구간별 추정 유동인구 CSV",
@@ -931,9 +1066,12 @@ def render_sidebar(df: pd.DataFrame) -> dict:
         "show_road_bg": show_road_bg,
         "show_road_layer": show_road_layer,
         "show_icing_layer": show_icing_layer,
-        "show_slope_layer": show_slope_layer,
+        "show_heating_gap_layer": show_heating_gap_layer,
+        "show_road_type_layer": show_road_type_layer,
+        "show_golmok_slope_layer": show_golmok_slope_layer,
+        "steep_only": steep_only,
         "selected_gus": selected_gus,
-        "selected_slope_levels": selected_levels,
+        "selected_road_types": selected_road_types,
         "year_range": (y_min, y_max),
         "metric_col": metric[0],
         "metric_label": metric[1],
@@ -973,16 +1111,24 @@ def render_map(df: pd.DataFrame, opts: dict, gu_metrics: pd.DataFrame) -> None:
             if bg:
                 layers.append(bg)
 
-    # 경사도 등급별 색상 도로
-    if opts["show_slope_layer"]:
+    # 도로유형(골목길/대형도로) 색상 도로
+    if opts["show_road_type_layer"]:
         road_features = _load_road_features()
         if road_features:
             by_gu = _split_roads_by_gu(road_features)
-            sl = build_slope_layer(
-                by_gu, opts["selected_gus"], opts["selected_slope_levels"]
+            rt = build_road_type_layer(
+                by_gu, opts["selected_gus"], opts["selected_road_types"]
             )
-            if sl is not None:
-                layers.append(sl)
+            if rt is not None:
+                layers.append(rt)
+
+    # 골목길 미끄러짐 위험 P(MAA<θ) — 1:1,000 경사
+    if opts["show_golmok_slope_layer"]:
+        golmok_paths = _load_golmok_paths()
+        if golmok_paths:
+            gsl = build_golmok_slope_layer(golmok_paths, opts["steep_only"])
+            if gsl is not None:
+                layers.append(gsl)
 
     # 열선 설치 도로 하이라이트
     if opts["show_road_layer"]:
@@ -996,7 +1142,7 @@ def render_map(df: pd.DataFrame, opts: dict, gu_metrics: pd.DataFrame) -> None:
             if not pts.empty:
                 layers.append(build_road_point_layer(pts))
 
-    # 유동인구 × 경사도 도로링크 레이어
+    # 기대 미끄러짐 = P(MAA<θ) × 유동인구
     if opts.get("show_foot_traffic_layer") and opts.get("ft_link_agg") is not None:
         link_data = _load_road_link_data()
         if link_data:
@@ -1010,6 +1156,14 @@ def render_map(df: pd.DataFrame, opts: dict, gu_metrics: pd.DataFrame) -> None:
         ic = build_icing_layer(snapped, opts["selected_gus"])
         if ic is not None:
             layers.append(ic)
+
+    # 위험군 골목길 & 열선 미설치 사각지대
+    if opts.get("show_heating_gap_layer"):
+        tier_nodes = _load_tier_risk_nodes()
+        if not tier_nodes.empty:
+            gap = build_heating_gap_layer(tier_nodes)
+            if gap is not None:
+                layers.append(gap)
 
     # 강조할 link_id 들 — 다중 또는 단일 모두 동일 흐름으로 처리
     highlight_lids = opts.get("highlight_lids") or []
@@ -1028,10 +1182,10 @@ def render_map(df: pd.DataFrame, opts: dict, gu_metrics: pd.DataFrame) -> None:
                     str(l) for l in highlight_lids
                     if not link_data.get(str(l).strip())
                 ]
-                st.warning(f"🔍 link_id 찾을 수 없음: {', '.join(miss)}")
+                st.warning(f"link_id 찾을 수 없음: {', '.join(miss)}")
         else:
             st.warning(
-                f"🔍 link_id `{', '.join(map(str, highlight_lids))}` 를 찾을 수 없습니다."
+                f"link_id `{', '.join(map(str, highlight_lids))}` 를 찾을 수 없습니다."
             )
 
     view_state = pdk.ViewState(
@@ -1074,63 +1228,11 @@ def render_kpis(df: pd.DataFrame, gu_metrics: pd.DataFrame) -> None:
 
 
 def render_data_status() -> None:
-    """데이터 파일 상태 표시."""
-    with st.sidebar.expander("📁 데이터 상태", expanded=False):
-        gj_path = DATA_PATH / GU_GEOJSON
-        rd_path = DATA_PATH / ROAD_SHAPEFILE
-        gj_ok = gj_path.exists()
-        rd_ok = rd_path.exists()
-
-        st.write(f"- 열선 CSV: ✅ `{HEATING_CSV}`")
-        st.write(
-            f"- 자치구 경계: {'✅' if gj_ok else '⚠️ 없음 (fallback)'} `{GU_GEOJSON}`"
-        )
-        if rd_ok:
-            mb = rd_path.stat().st_size / 1024 / 1024
-            st.write(f"- 도로 라인: ✅ `{ROAD_SHAPEFILE}` ({mb:.1f} MB)")
-        else:
-            st.write(f"- 도로 라인: ⚠️ 없음 (fallback) `{ROAD_SHAPEFILE}`")
-
-        icing_path = DATA_PATH / ICING_CSV
-        if icing_path.exists():
-            kb = icing_path.stat().st_size / 1024
-            st.write(f"- 결빙구간: ✅ `{ICING_CSV}` ({kb:.0f} KB)")
-        else:
-            st.write(f"- 결빙구간: ⚠️ 없음 `{ICING_CSV}`")
-
-        # 슬로프 처리 여부 (도로 GeoJSON의 첫 feature에 slope_pct 있는지)
-        if rd_ok:
-            try:
-                rd_feats = _load_road_features() or []
-                has_slope = any(
-                    f.get("properties", {}).get("slope_pct") is not None
-                    for f in rd_feats[:200]
-                )
-            except Exception:
-                has_slope = False
-            if has_slope:
-                st.write("- 경사도: ✅ 도로 GeoJSON에 포함")
-            else:
-                st.write(
-                    "- 경사도: ⚠️ 미처리 — `python3 scripts/preprocess_slope.py` 실행 필요"
-                )
-
-        # 도로링크 (선택 데이터)
-        rl_path = DATA_PATH / "road_links.geojson"
-        if rl_path.exists():
-            mb = rl_path.stat().st_size / 1024 / 1024
-            st.write(f"- 도로링크: ✅ `road_links.geojson` ({mb:.1f} MB)")
-        else:
-            st.write(
-                "- 도로링크: ⚠️ 없음 (유동인구 도로 시각화 비활성). "
-                "아래에서 업로드 가능."
-            )
-
-        st.markdown("---")
-        st.markdown("**📥 추가 데이터 업로드**")
+    """사이드바 — 추가 데이터 업로드만 둔다. 데이터 상태는 본문 '데이터 점검' 표 하나로 본다."""
+    with st.sidebar.expander("추가 데이터 업로드", expanded=False):
         extra = st.file_uploader(
             "zip 또는 단일 파일",
-            type=["zip", "geojson", "csv", "json"],
+            type=["zip", "geojson", "csv", "json", "parquet"],
             accept_multiple_files=True,
             key="extra_upload",
             label_visibility="collapsed",
@@ -1147,12 +1249,107 @@ def render_data_status() -> None:
                     except Exception:
                         pass
                 st.success(f"{len(placed_all)}개 파일 배치: {', '.join(placed_all)}")
+                st.cache_data.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"실패: {e}")
 
-        if not (gj_ok and rd_ok):
-            st.caption("README의 데이터 준비 섹션 참고.")
+
+@st.cache_data(show_spinner=False)
+def _flow_file_stats(content: bytes | None, name: str | None) -> dict | None:
+    """유동인구 파일 요약 — 업로드 파일이 있으면 그것, 없으면 기본 flpop.csv."""
+    try:
+        if content is not None:
+            d = _parse_foot_traffic(content, name)
+            src = f"{name} (업로드)"
+        else:
+            p = DATA_PATH / "flpop.csv"
+            if not p.exists():
+                return None
+            d = load_foot_traffic_csv(p)
+            src = "flpop.csv"
+    except Exception:
+        return None
+    return {"src": src, "rows": len(d), "links": set(d["link_id"].astype(str)),
+            "dongs": d["dong"].nunique() if "dong" in d else 0,
+            "gus": d["gu"].nunique() if "gu" in d else 0}
+
+
+def render_data_check(df: pd.DataFrame, opts: dict) -> None:
+    """데이터 점검 — 파일 존재·규모·결합 품질을 표 하나로."""
+    rows = []
+
+    def row(name, file, ok, size, quality, used):
+        rows.append({"데이터": name, "파일": file, "상태": ok, "규모": size,
+                     "결합·품질": quality, "쓰이는 곳": used})
+
+    # 열선 + 도로명 매칭
+    feats = _load_road_features()
+    if feats:
+        lines = match_roads(df, feats)
+        keys = {(r["gu"], rn) for _, r in df.iterrows() for rn in r["road_names"] if rn}
+        matched = {(m.gu, m.road_name) for m in lines}
+        q = f"도로명 {len(matched):,}/{len(keys):,} 매칭 ({100*len(matched)/max(len(keys),1):.1f}%)"
+    else:
+        q = "도로 라인 없음 → 자치구 중심점으로 표시"
+    row("열선 설치 현황", HEATING_CSV, "정상", f"{len(df):,}건 · {df['length_m'].sum()/1000:,.1f} km (필터 후)",
+        q, "KPI, 열선 레이어, 자치구 집계")
+
+    gj = _load_gu_geojson()
+    row("자치구 경계", GU_GEOJSON, "정상" if gj else "없음",
+        f"{len(gj.get('features', []))}개" if gj else "-", "-", "자치구 색상")
+
+    row("도로 라인 (OSM)", ROAD_SHAPEFILE, "정상" if feats else "없음",
+        f"{len(feats):,}개 라인" if feats else "-", "-", "배경 도로, 도로유형, 열선 매칭")
+
+    ic = _load_icing_seoul()
+    if not ic.empty:
+        snapped = _load_icing_snapped()
+        sr = 100 * len({x["seg_id"] for x in snapped if x["snap"] == "osm"}) / max(len(ic), 1)
+        row("상습 결빙구간", ICING_CSV, "정상", f"서울 {len(ic):,}건 · {ic['length_km'].sum():,.1f} km",
+            f"도로 라인 스냅 {sr:.1f}%", "결빙 레이어, 위험×결빙 표")
+    else:
+        row("상습 결빙구간", ICING_CSV, "없음", "-", "-", "결빙 레이어")
+
+    link_data = _load_road_link_data()
+    if link_data:
+        n = len(link_data)
+        n_s = sum(1 for v in link_data.values() if isinstance(v.get("slope_pct"), (int, float)))
+        n_g = sum(1 for v in link_data.values() if v.get("road_type") == "골목길")
+        row("도로링크 · 경사 (1:1,000)", "road_links.geojson", "정상",
+            f"{n:,}개 링크 (골목길 {n_g:,})", f"경사 보유 {100*n_s/n:.1f}%",
+            "골목길 위험 레이어, 기대 미끄러짐, 순위")
+    else:
+        row("도로링크 · 경사 (1:1,000)", "road_links.geojson", "없음", "-",
+            "Drive zip 또는 사이드바 업로드로 추가", "골목길 위험 레이어, 기대 미끄러짐, 순위")
+
+    LS = _load_link_risk_stats()
+    if LS is not None:
+        gm = LS[LS.road_type == "골목길"]
+        row("서울 링크 통계", "seoul_links.parquet", "정상",
+            f"{len(LS):,}개 링크 · 골목길 {gm.len.sum()/1000:,.0f} km",
+            f"경사 보유 {100*LS.slope_pct.notna().mean():.1f}% · 열선 링크 {int(LS.heat.sum()):,}",
+            "자치구 위험군·커버리지, 위험×결빙 표, 열선 최적배치 페이지")
+    else:
+        row("서울 링크 통계", "seoul_links.parquet", "없음", "-", "-", "자치구 위험군·커버리지")
+
+    up = opts.get("ft_upload")
+    fs = _flow_file_stats(up.getvalue() if up else None, up.name if up else None)
+    if fs:
+        hit = len(fs["links"] & set(link_data)) if link_data else 0
+        row("유동인구 (B030)", fs["src"], "정상",
+            f"{fs['rows']:,}행 · {len(fs['links']):,}개 링크 · {fs['gus']}개 구 {fs['dongs']}개 동",
+            f"도로링크 매칭 {100*hit/max(len(fs['links']),1):.1f}%",
+            "기대 미끄러짐 레이어·순위, 최적배치(2단계)")
+    else:
+        row("유동인구 (B030)", "flpop.csv", "없음", "-", "사이드바에서 업로드", "기대 미끄러짐")
+
+    tab = pd.DataFrame(rows)
+    n_ok = int((tab["상태"] == "정상").sum())
+    with st.expander(f"데이터 점검 — {len(tab)}개 중 {n_ok}개 정상", expanded=n_ok < len(tab)):
+        st.dataframe(tab, use_container_width=True, hide_index=True)
+        st.caption("없는 데이터가 있어도 앱은 동작하며 해당 기능만 비활성된다. "
+                   "추가는 사이드바 '추가 데이터 업로드' 또는 `data/` 폴더에 파일을 두면 된다.")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1160,14 +1357,14 @@ def render_data_status() -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 def _render_urgency_ranking(opts: dict) -> None:
-    """시급도 순위 분석 UI.
+    """기대 미끄러짐 순위 분석 UI.
 
-    유동인구 필터 결과(ft_link_agg) × 도로링크 경사도/길이로 점수 산출.
+    유동인구 필터 결과(ft_link_agg) × P(MAA<θ) = 기대 미끄러짐 건수로 순위.
     """
     agg = st.session_state.get("ft_link_agg")
     if agg is None or agg.empty:
         st.info(
-            "🚶 **유동인구 분석** 섹션에서 필터를 적용하면 자동으로 활성화됩니다. "
+            "**유동인구 분석** 섹션에서 필터를 적용하면 자동으로 활성화됩니다. "
             "(현재 필터 결과가 비어있음)"
         )
         return
@@ -1179,41 +1376,46 @@ def _render_urgency_ranking(opts: dict) -> None:
         )
         return
 
-    # 산식 선택 UI
-    ccol1, ccol2, ccol3 = st.columns([2, 2, 2])
-    method = ccol1.selectbox(
-        "점수 산식",
-        options=["geometric", "weighted_mean", "product"],
-        index=0,
-        format_func=lambda x: {
-            "geometric": "기하평균 √(경사 × 유동) ⭐ 추천",
-            "weighted_mean": "가중평균",
-            "product": "곱셈 (극단적)",
-        }[x],
-        help=(
-            "**기하평균**: 두 차원 모두 높을 때만 큼. "
-            "**가중평균**: 한 쪽만 높아도 점수 올라감. "
-            "**곱셈**: 한쪽이 낮으면 폭락."
-        ),
+    st.caption(
+        "순위 = **기대 미끄러짐 건수 = P(MAA<θ) × 유동인구** (발표자료 7~8쪽). "
+        "P(MAA<θ)는 WinterLab 빙판 보행 실측 58세션의 MAA 경험분포에서 경사 θ보다 "
+        "한계각이 낮은 사람의 비율이다."
     )
-    slope_weight = 0.5
-    if method == "weighted_mean":
-        slope_weight = ccol2.slider(
-            "경사도 비중",
-            min_value=0.0, max_value=1.0, value=0.5, step=0.1,
-            help="0 = 유동인구만, 1 = 경사도만",
-        )
-    top_n = ccol3.number_input(
+    top_n = st.number_input(
         "상위 N개 표시", min_value=10, max_value=200, value=30, step=10
     )
 
+    exclude_large = st.checkbox(
+        "대형도로 후보 제외 (추천)",
+        value=True,
+        help="OSM 도로유형 분류(TBGIS↔OSM 공간매칭, scripts/classify_road_type.py)상 "
+        "'대형도로'로 판정된 도로링크를 기대 미끄러짐 순위·후보군에서 제외합니다. "
+        "열선 설치 후보는 좁은 골목길이어야 하므로 기본 활성화 권장.",
+    )
+    exclude_types = {"대형도로"} if exclude_large else set()
+
+    # 도로유형 분포 (제외 적용 전, 필터된 agg 기준) — 제외 효과를 숫자로 확인
+    _rt_counts = (
+        agg["link_id"].astype(str)
+        .map(lambda k: link_data.get(k, {}).get("road_type", "unknown"))
+        .value_counts()
+    )
+    st.caption(
+        f"도로유형 분포(현재 필터 내 {len(agg):,}건): "
+        f"골목길 {int(_rt_counts.get('골목길', 0)):,} · "
+        f"대형도로 {int(_rt_counts.get('대형도로', 0)):,}"
+        f"{' → 후보에서 제외됨' if exclude_large else ' (제외 안 함)'} · "
+        f"애매(tertiary) {int(_rt_counts.get('애매', 0)):,} · "
+        f"미분류 {int(_rt_counts.get('unknown', 0)):,}"
+    )
+
     # 점수 계산
-    scored = compute_urgency_scores(agg, link_data, method=method, slope_weight=slope_weight)
+    scored = compute_urgency_scores(agg, link_data, exclude_road_types=exclude_types)
 
     # KPI
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("대상 도로링크", f"{len(scored):,}")
-    k2.metric("평균 시급도", f"{scored['urgency'].mean():.1f}")
+    k2.metric("기대 미끄러짐 합", f"{scored['expected_slips'].sum():,.1f}건")
     k3.metric(
         "총 길이",
         f"{scored['length_m'].sum()/1000:,.2f} km",
@@ -1222,12 +1424,12 @@ def _render_urgency_ranking(opts: dict) -> None:
     k4.metric(
         "상위 10% 평균 길이",
         f"{top10_pct['length_m'].mean():.0f} m",
-        help="시급도 상위 10% 도로링크의 평균 구간 길이",
+        help="기대 미끄러짐 상위 10% 도로링크의 평균 구간 길이",
     )
 
     # 표시용 컬럼명/순서 정리
     # ── 빠른 이동 multiselect ──
-    st.markdown("**🎯 지도로 빠르게 이동 (여러 개 선택 가능)**")
+    st.markdown("**지도로 빠르게 이동 (여러 개 선택 가능)**")
     top_for_jump = scored.head(int(top_n)).reset_index(drop=True)
 
     def _fmt_jump_option(idx: int) -> str:
@@ -1240,7 +1442,7 @@ def _render_urgency_ranking(opts: dict) -> None:
             f"{r['dong']}  ·  "
             f"경사 {slope_str}  ·  "
             f"길이 {int(r['length_m'])}m  ·  "
-            f"시급도 {r['urgency']:.1f}"
+            f"기대 미끄러짐 {r['expected_slips']:.1f}건"
         )
 
     qb1, qb2, qb3 = st.columns([1, 1, 1])
@@ -1272,7 +1474,7 @@ def _render_urgency_ranking(opts: dict) -> None:
         st.session_state["_jumped_lids"] = []
 
     st.caption(
-        "💡 사이드바 **🔍 도로링크 찾기** 에 link_id 를 직접 입력해도 동일하게 작동합니다. "
+        "사이드바 **도로링크 찾기** 에 link_id 를 직접 입력해도 동일하게 작동합니다. "
         "(다중 선택이 비어있을 때만 사이드바 입력값 사용)"
     )
     st.divider()
@@ -1284,42 +1486,38 @@ def _render_urgency_ranking(opts: dict) -> None:
     show["length_m"] = show["length_m"].round(0).astype(int)
     show["flow_sum"] = show["flow_sum"].round(1)
     show_disp = show[
-        ["link_id", "gu", "dong", "slope_level", "slope_pct",
-         "length_m", "flow_sum", "slope_score", "flow_score", "urgency"]
+        ["link_id", "gu", "dong", "road_type", "slope_pct", "risk",
+         "length_m", "flow_sum", "expected_slips"]
     ].rename(columns={
         "link_id": "도로링크ID",
         "gu": "자치구",
         "dong": "행정동",
-        "slope_level": "경사 등급",
+        "road_type": "도로유형",
         "slope_pct": "경사도 %",
+        "risk": "미끄러짐 확률 P(MAA<θ)",
         "length_m": "길이(m)",
-        "flow_sum": "유동인구 합",
-        "slope_score": "경사 점수",
-        "flow_score": "유동 점수",
-        "urgency": "🚨 시급도",
+        "flow_sum": "유동인구",
+        "expected_slips": "기대 미끄러짐(건)",
     })
     show_disp.insert(0, "순위", range(1, len(show_disp) + 1))
     st.dataframe(show_disp, use_container_width=True, hide_index=True)
 
     # 자치구·행정동별 시급도 평균 집계
-    st.markdown("**행정동별 시급도 집계** (구간 길이 가중평균)")
+    st.markdown("**행정동별 기대 미끄러짐 집계**")
     gby = (
         scored.groupby(["gu", "dong"], as_index=False)
         .apply(
             lambda g: pd.Series({
                 "구간 수": len(g),
                 "총 길이(km)": round(g["length_m"].sum() / 1000, 2),
-                "평균 시급도": round(g["urgency"].mean(), 1),
-                "길이가중 시급도": round(
-                    (g["urgency"] * g["length_m"]).sum() / max(g["length_m"].sum(), 1),
-                    1,
-                ),
-                "≥10% 구간 수": int((g["slope_level"] == "10_plus").sum()),
+                "기대 미끄러짐 합(건)": round(g["expected_slips"].sum(), 1),
+                "평균 미끄러짐 확률": round(g["risk"].mean(), 3),
+                "위험군(≥5.56%) 구간 수": int((g["slope_pct"] >= STEEP_PCT).sum()),
             }),
             include_groups=False,
         )
         .reset_index(drop=False)
-        .sort_values("길이가중 시급도", ascending=False)
+        .sort_values("기대 미끄러짐 합(건)", ascending=False)
     )
     if "level_0" in gby.columns:
         gby = gby.drop(columns=["level_0"])
@@ -1330,13 +1528,13 @@ def _render_urgency_ranking(opts: dict) -> None:
 
     # CSV 다운로드
     csv = scored[
-        ["link_id", "gu", "dong", "slope_level", "slope_pct",
-         "length_m", "flow_sum", "slope_score", "flow_score", "urgency"]
+        ["link_id", "gu", "dong", "road_type", "slope_pct", "risk",
+         "length_m", "flow_sum", "expected_slips"]
     ].to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "전체 시급도 순위 CSV 다운로드",
+        "전체 기대 미끄러짐 순위 CSV 다운로드",
         data=csv,
-        file_name=f"urgency_ranking_{method}.csv",
+        file_name="expected_slips_ranking.csv",
         mime="text/csv",
     )
 
@@ -1374,7 +1572,7 @@ def _render_foot_traffic_section(opts: dict) -> None:
         except Exception as e:
             st.error(f"CSV 로드 실패: {e}")
             return
-        source_label = f"📄 업로드: `{upload.name}`"
+        source_label = f"업로드: `{upload.name}`"
     elif default_path.exists():
         try:
             with default_path.open("rb") as f:
@@ -1382,10 +1580,10 @@ def _render_foot_traffic_section(opts: dict) -> None:
         except Exception as e:
             st.error(f"기본 데이터 로드 실패: {e}")
             return
-        source_label = f"📦 기본 데이터: `{default_path.name}`"
+        source_label = f"기본 데이터: `{default_path.name}`"
     else:
         st.info(
-            "유동인구 데이터가 없습니다. 사이드바 **🚶 유동인구 데이터** 에서 "
+            "유동인구 데이터가 없습니다. 사이드바 **유동인구 데이터** 에서 "
             "CSV 파일을 업로드하거나 `data/flpop.csv` 파일을 추가해주세요.\n\n"
             "기대 컬럼: `시군구명, 행정동명, 요일코드, 연령대코드, 시간대코드, 유동인구_수`"
         )
@@ -1399,17 +1597,17 @@ def _render_foot_traffic_section(opts: dict) -> None:
     # ── 빠른 프리셋 ──
     preset_cols = st.columns([1, 1, 1, 2])
     preset_dawn = preset_cols[0].button(
-        "🌅 출근시간(7-9시)",
+        "출근시간(7-9시)",
         help="평일 06-09 시간대만 필터 (결빙 취약 시간)",
         use_container_width=True,
     )
     preset_elderly = preset_cols[1].button(
-        "👴 60대 이상 평일",
+        "60대 이상 평일",
         help="평일 + 60대 이상 (낙상 위험층)",
         use_container_width=True,
     )
     preset_all = preset_cols[2].button(
-        "🔄 필터 초기화",
+        "필터 초기화",
         use_container_width=True,
     )
     if preset_dawn:
@@ -1443,14 +1641,14 @@ def _render_foot_traffic_section(opts: dict) -> None:
         day_codes = st.multiselect(
             "요일",
             options=list(DAY_LABELS.keys()),
-            default=st.session_state.get("ft_day_codes", []),
+            default=st.session_state.get("ft_day_codes", [1]),
             format_func=lambda c: f"{c} · {DAY_LABELS[c]}",
             key="ft_day_codes",
         )
         time_codes = st.multiselect(
             "시간대",
             options=list(DEFAULT_TIME_LABELS.keys()),
-            default=st.session_state.get("ft_time_codes", []),
+            default=st.session_state.get("ft_time_codes", [1, 2]),
             format_func=lambda c: f"{c} · {DEFAULT_TIME_LABELS[c]}",
             key="ft_time_codes",
         )
@@ -1462,6 +1660,10 @@ def _render_foot_traffic_section(opts: dict) -> None:
             key="ft_age_codes",
         )
 
+    # 연령 미선택 시 agrde_cd=0('전체') 행만 쓴다. 0 은 10~60 행의 정확한 합이라
+    # 전부 합치면 약 2배로 부풀려진다(구 KNOWN BUG). 발표 모형과 같은 처리.
+    if not age_codes and "age_code" in df.columns and (df["age_code"] == 0).any():
+        age_codes = [0]
     filt = filter_foot_traffic(
         df,
         gus=gus or None,
@@ -1491,7 +1693,7 @@ def _render_foot_traffic_section(opts: dict) -> None:
     )
     c4.metric("매칭 도로링크", f"{link_n:,}")
     st.caption(
-        "💡 사이드바 **유동인구 (TBGIS 도로링크)** 토글을 켜면 위 필터 결과가 "
+        "사이드바 **기대 미끄러짐 = P(MAA<θ) × 유동인구** 레이어를 켜면 위 필터 결과가 "
         "도로 색·두께로 지도에 표시됩니다."
     )
     st.divider()
@@ -1544,15 +1746,15 @@ def _render_data_bootstrap(missing: list[str]) -> None:
         A. Google Drive 다운로드 (온라인)
         B. 로컬 zip/geojson 업로드 (폐쇄망)
     """
-    st.title("📦 초기 데이터 준비")
+    st.title("초기 데이터 준비")
     st.error(
-        f"⚠️ **앱 실행에 필요한 필수 데이터 {len(missing)}개**가 없습니다. "
+        f"**앱 실행에 필요한 필수 데이터 {len(missing)}개**가 없습니다. "
         "아래 두 가지 방법 중 하나로 데이터를 채워주세요."
     )
 
     # 누락된 파일 상세 안내 표
     with st.container(border=True):
-        st.markdown("##### 📋 누락된 파일")
+        st.markdown("##### 누락된 파일")
         rows = []
         for name in missing:
             info = FILE_INFO.get(name, {})
@@ -1563,10 +1765,10 @@ def _render_data_bootstrap(missing: list[str]) -> None:
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.caption(
-            "💡 데이터를 한 zip 파일에 담아서 받으시면 자동으로 풀려서 배치됩니다."
+            "데이터를 한 zip 파일에 담아서 받으시면 자동으로 풀려서 배치됩니다."
         )
 
-    tab_dl, tab_up = st.tabs(["🌐 Google Drive 다운로드", "📁 로컬 파일 업로드"])
+    tab_dl, tab_up = st.tabs(["Google Drive 다운로드", "로컬 파일 업로드"])
 
     # ── 탭 A: Drive 다운로드 ──
     with tab_dl:
@@ -1676,6 +1878,35 @@ def _render_data_bootstrap(missing: list[str]) -> None:
     st.stop()
 
 
+def _gu_risk_table(LS: pd.DataFrame, gus: list[str] | None = None) -> pd.DataFrame:
+    """자치구별 골목길 위험군 현황 (발표자료 6쪽 표와 같은 축)."""
+    g = LS[LS.road_type == "골목길"]
+    if gus:
+        g = g[g.gu.isin(gus)]
+    t = g.assign(s_len=g.len.where(g.steep, 0.0),
+                 sh_len=g.len.where(g.steep & g.heat, 0.0))
+    out = t.groupby("gu").agg(골목길_km=("len", "sum"), 위험군_km=("s_len", "sum"),
+                              위험군_열선_km=("sh_len", "sum"),
+                              평균_P_MAA=("risk", "mean")).reset_index()
+    out[["골목길_km", "위험군_km", "위험군_열선_km"]] /= 1000
+    out["위험군비율%"] = 100 * out.위험군_km / out.골목길_km
+    out["커버리지%"] = 100 * out.위험군_열선_km / out.위험군_km.replace(0, float("nan"))
+    out = out.rename(columns={"gu": "자치구"}).round(
+        {"골목길_km": 1, "위험군_km": 1, "위험군_열선_km": 2, "평균_P_MAA": 3,
+         "위험군비율%": 1, "커버리지%": 1})
+    return out.sort_values("위험군_km", ascending=False)
+
+
+def _attach_gu_risk(gu_metrics: pd.DataFrame) -> pd.DataFrame:
+    """자치구 지표에 위험군 골목길 연장·커버리지를 붙인다 (지도 색상 기준용)."""
+    LS = _load_link_risk_stats()
+    if LS is None:
+        return gu_metrics.assign(steep_km=0.0, steep_cov_pct=0.0)
+    t = _gu_risk_table(LS)[["자치구", "위험군_km", "커버리지%"]].rename(
+        columns={"자치구": "gu", "위험군_km": "steep_km", "커버리지%": "steep_cov_pct"})
+    return gu_metrics.merge(t, on="gu", how="left").fillna({"steep_km": 0.0, "steep_cov_pct": 0.0})
+
+
 def main() -> None:
     # 초기 데이터 부트스트랩 — 필수 파일이 없으면 다운로드/업로드 UI 표시
     missing = missing_files(DATA_PATH)
@@ -1683,36 +1914,11 @@ def main() -> None:
         _render_data_bootstrap(missing)
         return  # st.stop() 후에는 도달 안 함
 
-    st.title("🛣️ 서울시 도로 열선 설치 현황")
+    st.title("서울시 도로 열선 설치 현황")
     st.caption(
         "2026년 자치구별 도로열선 설치현황 데이터 기반. "
         "레이어 토글로 자치구·도로를 비교하고, 아래 분석 섹션에서 표를 확인하세요."
     )
-
-    # 선택 데이터 누락 안내 (있어도 앱은 작동, 일부 기능만 비활성)
-    missing_opt = missing_optional(DATA_PATH)
-    if missing_opt:
-        with st.container(border=True):
-            st.warning(
-                "⚙️ **추가 기능을 위한 데이터가 없습니다.** 아래 파일을 "
-                "`data/` 폴더에 추가하면 해당 기능이 활성화됩니다. "
-                "(현재 상태로도 다른 기능은 모두 사용 가능)"
-            )
-            rows = []
-            for name in missing_opt:
-                info = FILE_INFO.get(name, {})
-                rows.append({
-                    "파일": name,
-                    "크기": info.get("size", "-"),
-                    "추가되면 활성화될 기능": info.get("desc", "-"),
-                })
-            st.dataframe(
-                pd.DataFrame(rows), use_container_width=True, hide_index=True
-            )
-            st.caption(
-                "💡 `seoul_roads.geojson` 받을 때 zip에 같이 담아 받으셔도 되고, "
-                "사이드바 **📁 데이터 상태 → 추가 데이터** 에서 별도 업로드도 가능합니다."
-            )
 
     # 데이터 로드
     try:
@@ -1732,11 +1938,12 @@ def main() -> None:
         df = df[df["year"].between(y_min, y_max)]
 
     # 집계
-    gu_metrics = compute_risk_score(aggregate_by_gu(df))
+    gu_metrics = _attach_gu_risk(compute_risk_score(aggregate_by_gu(df)))
     road_metrics = aggregate_by_road(df)
 
     # KPI
     render_kpis(df, gu_metrics)
+    render_data_check(df, opts)
     st.divider()
 
     # 지도 — 유동인구 도로링크 시각화용 집계 결과를 opts에 합쳐 전달
@@ -1751,11 +1958,14 @@ def main() -> None:
     else:
         opts["highlight_lids"] = []
 
-    st.subheader("🗺️ 지도")
+    st.subheader("지도")
     render_map(df, opts, gu_metrics)
 
+    st.divider()
+    render_delta_lab()
+
     # 분석 섹션 (접고 펼치기)
-    st.subheader("📊 분석")
+    st.subheader("분석")
 
     with st.expander("자치구별 집계", expanded=True):
         st.caption(
@@ -1768,322 +1978,86 @@ def main() -> None:
                     "road_count": "도로 수",
                     "total_length_m": "총 연장(m)",
                     "avg_length_m": "구간 평균(m)",
-                    "risk_score": "위험도 점수(임시)",
+                    "steep_km": "위험군 골목길(km)",
+                    "steep_cov_pct": "위험군 열선 커버리지(%)",
                 }
-            ),
+            ).drop(columns=["risk_score"], errors="ignore"),
             use_container_width=True,
             hide_index=True,
         )
 
-    with st.expander("도로별 집계 (도로명 단위)", expanded=False):
-        st.caption(
-            f"같은 도로명에서 발생한 여러 설치 구간을 합산. "
-            f"도로명을 추출하지 못한 {(df['primary_road']=='').sum()}건은 제외."
-        )
-        st.dataframe(
-            road_metrics.rename(
-                columns={
-                    "gu": "자치구",
-                    "primary_road": "도로명",
-                    "segment_count": "구간 수",
-                    "total_length_m": "총 연장(m)",
-                    "years": "설치연도",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with st.expander("원본 데이터 (필터 적용 후)", expanded=False):
-        st.caption("CSV 원문에 도로명 추출 결과를 덧붙인 형태.")
-        st.dataframe(
-            df.rename(
-                columns={
-                    "gu": "자치구",
-                    "year": "설치연도",
-                    "section": "설치구간",
-                    "length_m": "연장(m)",
-                    "primary_road": "대표 도로명",
-                    "road_names": "추출 도로명",
-                }
-            )[
-                [
-                    "자치구",
-                    "설치연도",
-                    "설치구간",
-                    "연장(m)",
-                    "대표 도로명",
-                    "추출 도로명",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with st.expander("경사도 분석 (자치구별 등급 분포)", expanded=False):
-        road_features = _load_road_features()
-        if not road_features:
-            st.info("도로 라인 GeoJSON이 없어 경사도 통계를 계산할 수 없습니다.")
-        elif not any(
-            f.get("properties", {}).get("slope_pct") is not None
-            for f in road_features[:200]
-        ):
-            st.warning(
-                "도로 GeoJSON에 `slope_pct` 컬럼이 없습니다. "
-                "`python3 scripts/preprocess_slope.py` 를 먼저 실행해주세요."
-            )
+    with st.expander("골목길 경사위험 (자치구별, 1:1,000)", expanded=False):
+        LS = _load_link_risk_stats()
+        if LS is None:
+            st.info("`data/seoul_links.parquet` 이 없어 계산할 수 없습니다.")
         else:
-            by_gu = _split_roads_by_gu(road_features)
-
-            # 자치구별 등급 분포 (선택된 자치구만)
-            rows = []
-            for gu in opts["selected_gus"]:
-                feats_g = by_gu.get(gu, [])
-                cnt = {lvl: 0 for lvl in SLOPE_LEVELS}
-                for f in feats_g:
-                    cnt[f["properties"].get("slope_level", "unknown")] += 1
-                total = sum(cnt.values()) or 1
-                rows.append(
-                    {
-                        "자치구": gu,
-                        "전체": total if total != 1 else len(feats_g),
-                        "≥6% 건수": cnt["6_10"] + cnt["10_plus"],
-                        "≥6% 비율": f"{(cnt['6_10']+cnt['10_plus'])/total*100:.1f} %",
-                        "≥10% 건수": cnt["10_plus"],
-                        **{SLOPE_LABELS[lv]: cnt[lv] for lv in SLOPE_LEVELS},
-                    }
-                )
-
-            # 전체 통계
-            total_all = sum(
-                1
-                for gu in opts["selected_gus"]
-                for _ in by_gu.get(gu, [])
-            )
-            steep_all = sum(
-                1
-                for gu in opts["selected_gus"]
-                for f in by_gu.get(gu, [])
-                if f["properties"].get("slope_level") in ("6_10", "10_plus")
-            )
-            very_steep = sum(
-                1
-                for gu in opts["selected_gus"]
-                for f in by_gu.get(gu, [])
-                if f["properties"].get("slope_level") == "10_plus"
-            )
-            c1, c2, c3 = st.columns(3)
-            c1.metric("필터내 도로 수", f"{total_all:,}")
-            c2.metric(
-                "경사도 ≥ 6%",
-                f"{steep_all:,}",
-                f"{steep_all/max(total_all,1)*100:.1f} %",
-            )
-            c3.metric(
-                "경사도 ≥ 10%",
-                f"{very_steep:,}",
-                f"{very_steep/max(total_all,1)*100:.1f} %",
-            )
-
-            st.caption("자치구별 경사도 등급 분포 (선택 자치구만)")
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander("경사도 × 결빙구간 교차 분석", expanded=False):
-        st.caption(
-            "OSM 도로 라인 매칭이 된 결빙구간의 경사도 분포를 봅니다. "
-            "6%↑ 결빙구간이 우선 열선 설치 대상으로 검토되어야 합니다."
-        )
-        road_features = _load_road_features()
-        snapped = _load_icing_snapped()
-        if road_features and snapped:
-            # 매칭된 OSM segment의 slope_level을 결빙 항목에 입혀 집계
-            # snap_icing_to_osm_paths 는 coords만 들고있어 직접 매칭 어려움.
-            # 대안: OSM 도로 (road_name, gu) → slope_level lookup 사전을 만들고
-            # 결빙의 (road_name, gu_start)로 lookup.
-            slope_by_key: dict[tuple[str, str], str] = {}
-            for feat in road_features:
-                props = feat.get("properties", {})
-                rn = props.get("road_name") or ""
-                gu = props.get("gu") or ""
-                if rn:
-                    key = (rn, gu)
-                    # 같은 도로명+자치구에 여러 segment 있으면 최댓값 등급으로 단순화
-                    cur = slope_by_key.get(key, "unknown")
-                    new = props.get("slope_level", "unknown")
-                    rank = {"unknown": 0, "0_3": 1, "3_6": 2, "6_10": 3, "10_plus": 4}
-                    if rank.get(new, 0) > rank.get(cur, 0):
-                        slope_by_key[key] = new
-
-            ic_by_lvl = {lvl: 0 for lvl in SLOPE_LEVELS}
-            for it in snapped:
-                if it["snap"] != "osm":
-                    ic_by_lvl["unknown"] += 1
-                    continue
-                key = (it["road_name"], it["gu"])
-                lvl = slope_by_key.get(key, "unknown")
-                ic_by_lvl[lvl] += 1
-
-            total_ic = sum(ic_by_lvl.values()) or 1
-            rows = [
-                {
-                    "경사도 등급": SLOPE_LABELS[lv],
-                    "결빙 매칭 건수": ic_by_lvl[lv],
-                    "비율": f"{ic_by_lvl[lv]/total_ic*100:.1f} %",
-                }
-                for lv in SLOPE_LEVELS
-            ]
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-            steep_ic = ic_by_lvl["6_10"] + ic_by_lvl["10_plus"]
-            st.metric(
-                "결빙구간 중 경사도 ≥ 6%",
-                f"{steep_ic} / {total_ic}",
-                f"{steep_ic/total_ic*100:.1f} %",
-            )
-        else:
-            st.info("도로 라인 또는 결빙 데이터가 없습니다.")
-
-    with st.expander("상습 결빙구간 분석", expanded=False):
-        df_icing_all = _load_icing_seoul()
-        if df_icing_all.empty:
-            st.info(f"`data/{ICING_CSV}` 가 없어 결빙구간을 표시할 수 없습니다.")
-        else:
-            # 자치구 필터 반영
-            mask = (
-                df_icing_all["gu"].isin(opts["selected_gus"])
-                | df_icing_all["gu_start"].isin(opts["selected_gus"])
-                | df_icing_all["gu_end"].isin(opts["selected_gus"])
-            )
-            df_icing = df_icing_all[mask]
-
-            # OSM 스냅 통계
-            snapped_all = _load_icing_snapped()
-            snapped_ids = {s["seg_id"] for s in snapped_all if s["snap"] == "osm"}
-            snap_rate = (
-                len(snapped_ids) / len(df_icing_all) * 100
-                if len(df_icing_all)
-                else 0
-            )
-
+            g = LS[(LS.road_type == "골목길") & LS.gu.isin(opts["selected_gus"])]
+            gs = g[g.steep]
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("결빙구간 (서울 전체)", f"{len(df_icing_all):,} 건")
-            c2.metric("필터 적용 후", f"{len(df_icing):,} 건")
-            c3.metric(
-                "OSM 스냅 성공률",
-                f"{snap_rate:.1f} %",
-                help="결빙 도로명이 OSM에서 매칭되어 실제 도로 형상으로 표시된 비율. "
-                "미매칭은 기점-종점 직선으로 fallback.",
-            )
-            c4.metric(
-                "필터 결빙 총 길이",
-                f"{df_icing['length_km'].sum():.1f} km",
-            )
-
-            # 자치구별 집계
-            gu_icing = (
-                df_icing.groupby("gu", as_index=False)
-                .agg(
-                    icing_count=("seg_id", "count"),
-                    icing_length_km=("length_km", "sum"),
-                )
-                .sort_values("icing_count", ascending=False)
-            )
-            gu_icing["icing_length_km"] = gu_icing["icing_length_km"].round(2)
-            st.caption("자치구별 결빙구간 집계 (필터 적용 후)")
-            st.dataframe(
-                gu_icing.rename(
-                    columns={
-                        "gu": "자치구",
-                        "icing_count": "결빙구간 수",
-                        "icing_length_km": "총 길이(km)",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # 도로분류별
-            cls_icing = (
-                df_icing.groupby("road_class", as_index=False)
-                .agg(count=("seg_id", "count"), length_km=("length_km", "sum"))
-                .sort_values("count", ascending=False)
-            )
-            cls_icing["length_km"] = cls_icing["length_km"].round(2)
-            st.caption("도로분류별 집계")
-            st.dataframe(
-                cls_icing.rename(
-                    columns={
-                        "road_class": "도로분류",
-                        "count": "건수",
-                        "length_km": "총 길이(km)",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander("도로 매칭 통계 (OSM ↔ CSV)", expanded=False):
-        road_features = _load_road_features()
-        if road_features:
-            road_lines = match_roads(df, road_features)
-            csv_keys = {
-                (r["gu"], rn)
-                for _, r in df.iterrows()
-                for rn in r["road_names"] if rn
-            }
-            matched_keys = {(m.gu, m.road_name) for m in road_lines}
-            exact = sum(1 for m in road_lines if m.match_type == "exact")
-            name_only = sum(1 for m in road_lines if m.match_type == "name_only")
-            cross_gu = sum(
-                1 for m in road_lines
-                if m.osm_gu and m.osm_gu != m.gu
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("CSV unique 도로명", f"{len(csv_keys):,}")
-            c2.metric(
-                "매칭 성공",
-                f"{len(matched_keys):,}",
-                f"{len(matched_keys)/max(len(csv_keys),1)*100:.1f}%",
-            )
-            c3.metric("정확 매칭 라인", f"{exact:,}")
-            c4.metric("자치구 불일치", f"{cross_gu:,}")
+            c1.metric("골목길 연장", f"{g.len.sum()/1000:,.0f} km")
+            c2.metric("위험군(≥5.56%) 연장", f"{gs.len.sum()/1000:,.0f} km",
+                      f"{100*gs.len.sum()/max(g.len.sum(),1):.1f}%", delta_color="off")
+            c3.metric("위험군 열선 커버리지", f"{100*gs[gs.heat].len.sum()/max(gs.len.sum(),1):.1f}%")
+            c4.metric("골목길 평균 P(MAA<θ)", f"{g.risk.mean():.3f}")
+            st.dataframe(_gu_risk_table(LS, opts["selected_gus"]),
+                         use_container_width=True, hide_index=True)
             st.caption(
-                "자치구 불일치: CSV의 관리주체 자치구와 OSM 상의 도로 위치 자치구가 "
-                "다른 경우. 도로 라인 hover시 ※표시로 확인 가능."
+                "위험군 = 경사 ≥5.56%(장애인등편의법 접근로 기울기 1/18). P(MAA<θ) = "
+                "WinterLab 빙판 보행 실측 MAA 경험분포로 본 미끄러짐 확률. 경사는 "
+                "수치지형도 1:1,000 등고선 기반. 커버리지는 링크 매칭된 열선 기준이라 "
+                "자치구 신고 연장(대형도로 포함)과 다를 수 있다."
             )
-        else:
-            st.info("도로 라인 GeoJSON이 없어 매칭 통계를 계산할 수 없습니다.")
 
-    with st.expander("🚶 유동인구 분석 (피봇 테이블)", expanded=False):
+    with st.expander("미끄러짐 위험 × 상습 결빙구간", expanded=False):
+        LS = _load_link_risk_stats()
+        if LS is None:
+            st.info("`data/seoul_links.parquet` 이 없어 계산할 수 없습니다.")
+        else:
+            g = LS[LS.gu.isin(opts["selected_gus"])]
+            bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0001]
+            labels = ["0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"]
+            tab = (g.assign(구간=pd.cut(g.risk, bins, right=False, labels=labels))
+                    .groupby(["구간", "icing"], observed=False).len.sum().unstack(fill_value=0)
+                    .rename(columns={False: "일반 km", True: "결빙구간 km"}) / 1000).round(1)
+            tab = tab.reset_index().rename(columns={"구간": "P(MAA<θ)"})
+            st.dataframe(tab, use_container_width=True, hide_index=True)
+            ic = g[g.icing]
+            gm = g[g.road_type == "골목길"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("결빙구간 링크 평균 P(MAA<θ)", f"{ic.risk.mean():.3f}")
+            c2.metric("결빙구간 중 골목길 비율", f"{100*(ic.road_type=='골목길').mean():.1f}%")
+            c3.metric("위험군 골목길 중 결빙 지정", f"{100*gm[gm.steep].icing.mean():.1f}%")
+            st.caption("발표자료 3·6쪽: 결빙취약구간 지정은 대형도로에 편중되고 경사 골목을 잘 잡지 못한다.")
+
+    with st.expander("유동인구 분석 (피봇 테이블)", expanded=False):
         _render_foot_traffic_section(opts)
 
-    with st.expander("🚨 시급도 순위 (경사도 × 유동인구)", expanded=False):
+    with st.expander("기대 미끄러짐 순위 (P(MAA<θ) × 유동인구)", expanded=False):
         _render_urgency_ranking(opts)
 
-    with st.expander("위험도 점수 (placeholder)", expanded=False):
-        st.warning(
-            "현재 위험도 점수는 **설치 길이가 짧을수록 위험이 크다**는 가정의 임시 점수입니다. "
-            "추후 도로 경사도, 결빙위험 등의 실제 데이터가 들어오면 이 컬럼을 교체할 예정."
-        )
-        st.dataframe(
-            gu_metrics[["gu", "total_length_m", "risk_score"]].rename(
-                columns={
-                    "gu": "자치구",
-                    "total_length_m": "총 연장(m)",
-                    "risk_score": "위험도 점수(임시)",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+    with st.expander("열선 설치 원자료 (도로별 집계 · 원본)", expanded=False):
+        t_road, t_raw = st.tabs(["도로명별 집계", "원본 (필터 적용 후)"])
+        with t_road:
+            st.caption(
+                f"같은 도로명의 여러 설치 구간을 합산. "
+                f"도로명을 추출하지 못한 {(df['primary_road']=='').sum()}건은 제외."
+            )
+            st.dataframe(
+                road_metrics.rename(columns={
+                    "gu": "자치구", "primary_road": "도로명", "segment_count": "구간 수",
+                    "total_length_m": "총 연장(m)", "years": "설치연도"}),
+                use_container_width=True, hide_index=True,
+            )
+        with t_raw:
+            st.dataframe(
+                df.rename(columns={
+                    "gu": "자치구", "year": "설치연도", "section": "설치구간",
+                    "length_m": "연장(m)", "primary_road": "대표 도로명",
+                    "road_names": "추출 도로명"})[
+                    ["자치구", "설치연도", "설치구간", "연장(m)", "대표 도로명", "추출 도로명"]],
+                use_container_width=True, hide_index=True,
+            )
+
 
 
 if __name__ == "__main__":

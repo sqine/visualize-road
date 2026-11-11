@@ -319,6 +319,71 @@ def filter_roads_by_slope(
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 도로유형 (골목길 / 대형도로 / 애매) — OSM highway 태그 기반 분류
+# ──────────────────────────────────────────────────────────────────────
+#
+# 골목길 열선 설치 후보는 좁은 생활도로만 대상이어야 하므로, OSM highway
+# 태그를 3 그룹으로 나눈다. 시급도/최적화 후보 산출 시 '대형도로'는 기본
+# 제외 대상이 된다 (TBGIS road_links.geojson 쪽은
+# scripts/classify_road_type.py 가 이 동일 분류를 공간매칭으로 부여해둠).
+
+ROAD_TYPE_GOLMOK_HW = {"residential", "living_street", "unclassified"}
+ROAD_TYPE_LARGE_HW = {
+    "primary", "secondary", "trunk", "motorway",
+    "primary_link", "secondary_link", "trunk_link", "motorway_link",
+    "busway", "corridor", "platform", "road",
+}
+ROAD_TYPE_AMBIGUOUS_HW = {"tertiary", "tertiary_link"}
+
+ROAD_TYPE_LEVELS = ("골목길", "애매", "대형도로", "unknown")
+ROAD_TYPE_LABELS = {
+    "골목길": "골목길 (residential/living_street/unclassified)",
+    "애매": "애매 (tertiary — 폭/차로수 확인 권장)",
+    "대형도로": "대형도로 (primary/secondary/trunk/motorway 등)",
+    "unknown": "미분류 (태그 없음/기타)",
+}
+# [R, G, B, A] — 초록(골목길) / 노랑(애매) / 파랑(대형도로) / 회색(미분류)
+ROAD_TYPE_COLORS = {
+    "골목길": [70, 170, 100, 190],
+    "애매": [230, 195, 60, 190],
+    "대형도로": [70, 110, 210, 170],
+    "unknown": [150, 150, 150, 80],
+}
+
+
+def highway_to_road_type(highway: str | None) -> str:
+    """OSM highway 태그 값 → '골목길' / '대형도로' / '애매' / 'unknown'."""
+    if not highway:
+        return "unknown"
+    if highway in ROAD_TYPE_GOLMOK_HW:
+        return "골목길"
+    if highway in ROAD_TYPE_LARGE_HW:
+        return "대형도로"
+    if highway in ROAD_TYPE_AMBIGUOUS_HW:
+        return "애매"
+    return "unknown"
+
+
+def filter_roads_by_road_type(
+    features_by_gu: dict[str, list[dict]],
+    selected_gus: list[str],
+    selected_types: list[str],
+) -> list[dict]:
+    """선택된 자치구 + 도로유형에 해당하는 도로 features 반환 (OSM highway 기준)."""
+    if not features_by_gu or not selected_gus or not selected_types:
+        return []
+    sel = set(selected_types)
+    out: list[dict] = []
+    for gu in selected_gus:
+        for feat in features_by_gu.get(gu, []):
+            hw = feat.get("properties", {}).get("highway", "")
+            rt = highway_to_road_type(hw)
+            if rt in sel:
+                out.append(feat)
+    return out
+
+
 def snap_icing_to_osm_paths(
     df_icing: "pd.DataFrame",
     road_features: list[dict] | None,

@@ -66,11 +66,11 @@ FILE_INFO: dict[str, dict] = {
 }
 
 # Drive 다운로드 기본 URL.
-# road_data.zip 안에 seoul_roads.geojson + road_links.geojson 두 파일.
+# road_data_20261111.zip 안에 seoul_roads.geojson + road_links.geojson(1:1,000 경사 반영) 두 파일.
 # 사용자가 UI 입력란에서 덮어쓸 수 있고, Streamlit secrets.toml 의
 # DATA_DRIVE_URL 키로도 설정 가능.
 DEFAULT_DRIVE_URL = (
-    "https://drive.google.com/file/d/1Mn8bvZF5UIpCqg1WYBGekx1Gkdc1NX3h/view"
+    "https://drive.google.com/file/d/12fNV9vIaUQrHqm4MvdsoCiqZ94rAU7Py/view"
 )
 
 

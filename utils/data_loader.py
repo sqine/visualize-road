@@ -96,12 +96,20 @@ def load_heating_csv(path: str | Path) -> pd.DataFrame:
         "관리기관": "gu",
         "설치연도": "year",
         "설치구간": "section",
+        "설치위치(시점~종점)": "section",  # 2026.05.31 갱신본부터 컬럼명 변경
         "연장(m)": "length_m",
+        "설치연장(m)": "length_m",  # 2026.05.31 갱신본부터 컬럼명 변경
     }
     df = df.rename(columns=rename_map)
 
     # 타입 정리
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    # 주의: "설치연도" 값이 "2023.10." (2023년 10월)처럼 연-월이 함께 인코딩된
+    # 경우가 있음(2026.05.31 갱신본부터 확인됨). pd.to_numeric을 그대로 쓰면
+    # "2023.10."과 "2023.1."이 둘 다 2023.1로 파싱되어 서로 구분이 안 되고
+    # Int64 캐스팅도 실패하므로, 앞 4자리(연도)만 정규식으로 추출한다.
+    df["year"] = pd.to_numeric(
+        df["year"].astype(str).str.extract(r"(\d{4})")[0], errors="coerce"
+    ).astype("Int64")
     df["length_m"] = pd.to_numeric(df["length_m"], errors="coerce").fillna(0).astype(int)
     df["gu"] = df["gu"].astype(str).str.strip()
     df["section"] = df["section"].astype(str).str.strip()

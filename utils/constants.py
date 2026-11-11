@@ -42,3 +42,4 @@ GU_GEOJSON = "seoul_gu.geojson"          # 사용자가 직접 추가하면 인�
 ROAD_SHAPEFILE = "seoul_roads.geojson"   # 도로명 라인 shp/geojson (선택)
 ICING_CSV = "icing_zones.csv"            # 행정안전부 상습결빙구간 (전국)
 ROAD_LINKS_GEOJSON = "road_links.geojson"  # TBGIS 도로링크 (유동인구 매칭용)
+ROAD_GRAPH_NODES_CSV = "road_graph_nodes.csv"  # 4개동 후보 1,190개 (경사·유동·LST·결빙·열선 통합)
