@@ -458,7 +458,7 @@ class OptConfig:
     h_min: float = M.H_MIN
     cost_per_m: float = M.COST_PER_M
     weight_mode: str = "current"    # "current"(엣지전류·MSA) | "simple"(하류 risk×flow)
-    msa_iters: int = 8
+    msa_iters: int = 15   # 4개동 S2(+30%, δ=5)가 10회에 수렴 — 8회는 부족
     time_limit: float | None = None
     n_src: int | None = None
 
@@ -479,6 +479,7 @@ class OptContext:
     _flow_graph: tuple | None = None
     _w0: dict | None = None
     _ref: float | None = None
+    _k0: float | None = None          # 엣지전류 → 전이 가중치 고정 척도 (평가용)
     cache: dict = field(default_factory=dict)
 
 
@@ -572,12 +573,62 @@ def solve_budget(ctx: OptContext, B_won: float, delta: float | None = None) -> d
     return res
 
 
-def plan_metrics(ctx: OptContext, S: set, B_won: float) -> dict:
-    """배치 S의 성과지표 — 발표자료 10쪽 표와 같은 정의.
+def _edge_scale(ctx: OptContext) -> float:
+    """평가용 고정 척도 k0. 새 열선이 없는 상태(결빙 없음)의 w0 와 같은 척도:
+    w0_ij = k0 · risk_j · I_ij  (I = 엣지전류). 모든 배치를 같은 k0 로 재야
+    배치 간 비교가 된다(MSA 안의 w 는 반복마다 평균으로 다시 맞추므로 평가에 못 씀)."""
+    _ensure_flow_graph(ctx)
+    if ctx._k0 is None:
+        Gg, nodes, idx, edges, ep, Dg, fl = ctx._flow_graph
+        acc = M.edge_currents(Gg, nodes, idx, edges, fl, frozenset(), n_src=ctx.cfg.n_src)
+        raw = [ctx.risk[j] * acc[ep[(i, j)]] for (i, j) in Dg]
+        m = float(np.mean(raw)) if raw else 0.0
+        ctx._k0 = (ctx._ref / m) if m > 0 else 0.0
+    return ctx._k0
 
-    경사위험 방지 = Σ_{i∈S} risk_i·flow_i (기대 미끄러짐 방지 건수)
-    위험경계      = #{(i,j): i∈S 상류, j∉S 하류, 낙차 ≥ h_min}
-    하류 전이위험 = Σ_{위험경계} risk_j·flow_j
+
+def edge_exposure(ctx: OptContext, S: set) -> tuple[float | None, dict]:
+    """하류 전이위험 — 발표자료 10쪽 정의: Σ_(잔여 경계) 경계 통행량 × 하류 미끄러짐 확률.
+
+    경계 통행량 = 배치 S 에서 결빙 구간(후보 중 미설치)의 컨덕턴스를 낮춘
+    current-flow 엣지전류. 반환: (값, {경계쌍: 기여}) — 지도용.
+    """
+    key = ("edge", frozenset(S))
+    if key in ctx.cache:
+        return ctx.cache[key]
+    try:
+        k0 = _edge_scale(ctx)
+    except Exception:
+        return None, {}
+    Gg, nodes, idx, edges, ep, Dg, fl = ctx._flow_graph
+    ice = frozenset(n for n in ctx.cand if n not in S and n in Gg)
+    acc = M.edge_currents(Gg, nodes, idx, edges, fl, ice, n_src=ctx.cfg.n_src)
+    contrib = {(i, j): k0 * ctx.risk[j] * acc[ep[(i, j)]]
+               for (i, j) in ctx.D_all if i in S and j not in S and (i, j) in ep}
+    out = (float(sum(contrib.values())), contrib)
+    ctx.cache[key] = out
+    return out
+
+
+def boundary_currents(ctx: OptContext) -> dict:
+    """모든 하류쌍 D 의 경계 통행량(엣지전류, 결빙 없음 기준) — 네트워크 전이 지도용."""
+    _edge_scale(ctx)
+    Gg, nodes, idx, edges, ep, Dg, fl = ctx._flow_graph
+    key = ("acc0",)
+    if key not in ctx.cache:
+        ctx.cache[key] = M.edge_currents(Gg, nodes, idx, edges, fl, frozenset(),
+                                         n_src=ctx.cfg.n_src)
+    acc = ctx.cache[key]
+    return {(i, j): float(acc[ep[(i, j)]]) for (i, j) in ctx.D_all if (i, j) in ep}
+
+
+def plan_metrics(ctx: OptContext, S: set, B_won: float) -> dict:
+    """배치 S의 성과지표.
+
+    경사위험 방지          = Σ_{i∈S} risk_i·flow_i (기대 미끄러짐 방지 건수)
+    위험경계               = #{(i,j): i∈S 상류, j∉S 하류, 낙차 ≥ h_min}
+    하류 전이위험(경계 통행) = Σ_{위험경계} 경계 통행량 × risk_j  ← 발표 10쪽 정의·목적함수와 같은 양
+    하류 전이위험(하류 통행) = Σ_{위험경계} risk_j·flow_j         ← 발표 10쪽 표의 수치가 이 값
     """
     G, risk, flow = ctx.G, ctx.risk, ctx.flow
     S = set(S)
@@ -585,6 +636,7 @@ def plan_metrics(ctx: OptContext, S: set, B_won: float) -> dict:
     ben = sum(risk[n] * flow[n] for n in S)
     bnd = [(i, j) for (i, j) in ctx.D_all if i in S and j not in S]
     expo = sum(risk[j] * flow[j] for (i, j) in bnd)
+    expo_edge, _ = edge_exposure(ctx, S)
     golmok_len = sum(G.nodes[n].get("length_m") or 0 for n in ctx.cand)
     return {
         "selected": S,
@@ -596,12 +648,60 @@ def plan_metrics(ctx: OptContext, S: set, B_won: float) -> dict:
         "benefit": ben,
         "boundary": len(bnd),
         "exposure": expo,
+        "exposure_edge": expo_edge,
         "mean_slope": float(np.mean([ctx.slope[n] for n in S])) if S else None,
         "mean_flow": float(np.mean([flow[n] for n in S])) if S else None,
         "coverage_len_pct": 100 * ln / golmok_len if golmok_len else None,
         "coverage_risk_pct": 100 * ben / ctx.total_risk if ctx.total_risk else None,
         "won_per_slip": (ln * ctx.cfg.cost_per_m / ben) if ben else None,
     }
+
+
+def _r1(v):
+    return None if v is None else round(v, 1)
+
+
+def delta_sweep(ctx: OptContext, B_won: float, deltas: list[float],
+                progress: Callable[[float, str], None] | None = None) -> pd.DataFrame:
+    """예산 고정, δ 격자 스윕 (발표자료 11쪽의 한 예산선)."""
+    base = solve_budget(ctx, B_won, 0.0)
+    rows = []
+    for k, d in enumerate(deltas):
+        if progress:
+            progress(k / len(deltas), f"δ = {d:g} ({k+1}/{len(deltas)})")
+        r = solve_budget(ctx, B_won, d)
+        rows.append({
+            "δ": d, "선정": r["n"], "연장m": round(r["length_m"]),
+            "경사위험방지": round(r["benefit"], 1),
+            "편익손실%": round(100 * (1 - r["benefit"] / base["benefit"]), 2) if base["benefit"] else 0.0,
+            "위험경계": r["boundary"],
+            "전이위험_경계통행": _r1(r["exposure_edge"]),
+            "전이위험_하류통행": round(r["exposure"], 1),
+            "MSA반복": r["msa_iters"], "수렴": r["converged"],
+        })
+    if progress:
+        progress(1.0, "완료")
+    df = pd.DataFrame(rows)
+    for col in ("전이위험_경계통행", "전이위험_하류통행"):
+        b0 = df.loc[df["δ"] == 0, col]
+        b0 = float(b0.iloc[0]) if len(b0) and b0.iloc[0] else None
+        df[col.replace("전이위험", "감소%")] = (
+            (100 * (1 - df[col] / b0)).round(1) if b0 else 0.0)
+    return df
+
+
+def knee_delta(df: pd.DataFrame, col: str = "감소%_경계통행") -> float | None:
+    """편익손실%–전이위험 감소% 곡선의 파레토 전환점 (Kneedle: 양 끝 현에서 가장 먼 점)."""
+    d = df.dropna(subset=[col]).sort_values("δ")
+    if len(d) < 3:
+        return None
+    x = d["편익손실%"].to_numpy(float); y = d[col].to_numpy(float)
+    dx, dy = x[-1] - x[0], y[-1] - y[0]
+    nrm = (dx * dx + dy * dy) ** 0.5
+    if nrm == 0:
+        return None
+    dist = np.abs(dy * (x - x[0]) - dx * (y - y[0])) / nrm
+    return float(d["δ"].iloc[int(dist.argmax())])
 
 
 def sweep(ctx: OptContext, budgets_won: list[float],
@@ -618,9 +718,11 @@ def sweep(ctx: OptContext, budgets_won: list[float],
             "예산억": round(B / 1e8, 2),
             "선정": r["n"], "연장m": round(r["length_m"]),
             "경사위험방지": round(r["benefit"], 1),
-            "위험경계": r["boundary"], "하류전이위험": round(r["exposure"], 1),
+            "위험경계": r["boundary"],
+            "전이위험_경계통행": _r1(r["exposure_edge"]), "전이위험_하류통행": round(r["exposure"], 1),
             "δ0_경사위험방지": round(b0["benefit"], 1),
-            "δ0_위험경계": b0["boundary"], "δ0_하류전이위험": round(b0["exposure"], 1),
+            "δ0_위험경계": b0["boundary"],
+            "δ0_전이위험_경계통행": _r1(b0["exposure_edge"]), "δ0_전이위험_하류통행": round(b0["exposure"], 1),
             "현행대비배": round(r["benefit"] / ctx.current["benefit"], 1) if ctx.current["benefit"] else None,
             "MSA반복": r["msa_iters"], "수렴": r["converged"],
             "_B": B,
@@ -670,5 +772,6 @@ def strategy_compare(ctx: OptContext, B_won: float) -> pd.DataFrame:
                     "평균통행": round(r["mean_flow"], 1) if r["mean_flow"] is not None else None,
                     "경사위험방지": round(r["benefit"], 1),
                     "위험경계": r["boundary"],
-                    "하류전이위험": round(r["exposure"], 1)})
+                    "전이위험(경계통행)": _r1(r["exposure_edge"]),
+                    "전이위험(하류통행)": round(r["exposure"], 1)})
     return pd.DataFrame(out)

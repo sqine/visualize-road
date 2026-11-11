@@ -31,7 +31,6 @@ from utils import milp as M  # noqa: E402
 from utils import region as R  # noqa: E402
 from utils.data_bootstrap import extract_archive_to, save_uploaded_to  # noqa: E402
 
-st.set_page_config(page_title="열선 최적 배치", layout="wide")
 
 # 의미색 — 발표자료와 같은 계열
 C_BG = [185, 194, 206, 90]
@@ -405,29 +404,136 @@ with tabs[0]:
 
 
 # ── 4-2. MILP ─────────────────────────────────────────────────────────
+def _solution_view(ctx, res, res0, B, delta, kp, show_net_default=False):
+    """한 해(예산 B, δ)의 지도 + 통계. 예산 탐색·δ 탐색 탭이 함께 쓴다."""
+    cur = ctx.current
+    mcol, scol = st.columns([1.75, 1])
+    with mcol:
+        t = st.columns(2)
+        show_cur = t[0].toggle("현행 열선 함께 표시", value=True, key=f"{kp}_cur")
+        show_net = t[1].toggle("경계 통행량(네트워크 전이) 표시", value=show_net_default,
+                               key=f"{kp}_net",
+                               help="낙차 2 m 이상 인접쌍의 상류→하류 연결을 경계 통행량(엣지전류)에 비례한 굵기로 그린다.")
+        layers = [_dong_layer(polys, gu, dongs),
+                  _path_layer(_paths(G, geom, list(G.nodes()), C_BG, 1), "bg")]
+        if show_net:
+            cur_d = R.boundary_currents(ctx)
+            if cur_d:
+                q = max(np.quantile(list(cur_d.values()), 0.98), 1e-9)
+                lines = [{"path": [[G.nodes[i]["lon"], G.nodes[i]["lat"]],
+                                   [G.nodes[j]["lon"], G.nodes[j]["lat"]]],
+                          "color": [70, 90, 130, int(35 + 110 * min(c / q, 1))],
+                          "width": 1 + 3 * min(c / q, 1), "lid": f"{i}→{j}", "dong": "-",
+                          "slope": "-", "flow": f"{c:.1f}", "len": "-", "tag": "[경계 통행량]"}
+                         for (i, j), c in cur_d.items()]
+                layers.append(_path_layer(lines, "net"))
+        if show_cur:
+            hn = [n for n in G.nodes() if G.nodes[n].get("heating_installed_precise")]
+            layers.append(_path_layer(_paths(G, geom, hn, C_HEAT, 4,
+                                             lambda n: {"tag": "[현행 열선]"}), "heat"))
+        layers.append(_path_layer(_paths(
+            G, geom, res["selected"], C_SEL, 5,
+            lambda n: {"tag": f"[선정] 기대방지 {ctx.risk[n]*ctx.flow[n]:.1f}건"}), "sel"))
+        _, contrib = R.edge_exposure(ctx, res["selected"])
+        by_down = {}
+        for (i, j) in res["boundaries"]:
+            by_down[j] = by_down.get(j, 0) + (contrib.get((i, j)) or ctx.risk[j] * ctx.flow[j])
+        if by_down:
+            emax = max(by_down.values()) or 1
+            pts = pd.DataFrame([{"lon": G.nodes[j]["lon"], "lat": G.nodes[j]["lat"],
+                                 "a": int(90 + 160 * e / emax), "r": 3 + 7 * (e / emax) ** 0.5}
+                                for j, e in by_down.items()])
+            pts["c"] = pts.a.apply(lambda a: C_BND + [a])
+            layers.append(pdk.Layer("ScatterplotLayer", data=pts, id="rb",
+                                    get_position="[lon, lat]", get_radius="r",
+                                    radius_units='"pixels"', get_fill_color="c",
+                                    stroked=True, get_line_color=[255, 255, 255],
+                                    line_width_min_pixels=1, pickable=False))
+        st.pydeck_chart(_deck(G, layers), use_container_width=True)
+        st.caption("주황 = 선정 구간 · 파랑 = 현행 열선 · 빨간 원 = 잔여 경계의 하류(진하고 클수록 하류 전이위험이 큼)"
+                   + (" · 남색 선 = 경계 통행량" if show_net else ""))
+
+    with scol:
+        st.markdown(f"##### 예산 {B/1e8:,.2f}억 · δ={delta:g}")
+        m1, m2 = st.columns(2)
+        m1.metric("선정 구간", f"{res['n']}곳", f"{res['length_m']:,.0f} m", delta_color="off")
+        m2.metric("집행액", f"{res['spent_won']/1e8:,.2f}억",
+                  f"잔액 {(B-res['spent_won'])/1e8:,.2f}억", delta_color="off")
+        m1.metric("경사위험 방지", f"{res['benefit']:,.1f}건",
+                  f"현행 대비 {res['benefit']/cur['benefit']:.1f}배" if cur["benefit"] else None,
+                  delta_color="off", help="Σ 선정 구간 P(MAA<θ) × 유동인구 = 기대 미끄러짐 방지 건수")
+        m2.metric("위험 커버율", f"{res['coverage_risk_pct']:.1f}%",
+                  f"연장 커버 {res['coverage_len_pct']:.1f}%", delta_color="off",
+                  help="후보군 전체 기대 미끄러짐 중 선정 구간이 막는 비율")
+        m1.metric("위험경계", f"{res['boundary']}곳",
+                  f"{res['boundary']-res0['boundary']:+d} vs δ=0", delta_color="inverse")
+        e, e0 = res["exposure_edge"], res0["exposure_edge"]
+        m2.metric("하류 전이위험", f"{e:,.1f}" if e is not None else "-",
+                  f"{100*(e/e0-1):+.0f}% vs δ=0" if e and e0 else None, delta_color="inverse",
+                  help="Σ 잔여 경계의 경계 통행량(엣지전류) × 하류 미끄러짐 확률. 발표 10쪽 정의·목적함수와 같은 양")
+        loss = 100 * (1 - res["benefit"] / res0["benefit"]) if res0["benefit"] else 0
+        st.caption(f"δ=0 대비 편익 {loss:.1f}% 양보 · 건당 {res['won_per_slip']/1e4:,.0f}만원 · "
+                   f"하류 통행 기준 전이위험 {res['exposure']:,.1f} (발표 표 수치)"
+                   if res["won_per_slip"] else "")
+        cmp = pd.DataFrame([
+            {"": "현행 실제", "구간": cur["n"], "편익": round(cur["benefit"], 1),
+             "경계": cur["boundary"], "전이위험": R._r1(cur["exposure_edge"])},
+            {"": "위험×통행 (δ=0)", "구간": res0["n"], "편익": round(res0["benefit"], 1),
+             "경계": res0["boundary"], "전이위험": R._r1(e0)},
+            {"": f"제안 (δ={delta:g})", "구간": res["n"], "편익": round(res["benefit"], 1),
+             "경계": res["boundary"], "전이위험": R._r1(e)},
+        ])
+        st.dataframe(cmp, hide_index=True, use_container_width=True)
+        if not res["converged"] and ctx.cfg.weight_mode == "current":
+            st.caption(f"MSA {ctx.cfg.msa_iters}회 안에 고정점 미수렴 — 마지막 해를 표시")
+
+    with st.expander("같은 예산, 선정 기준별 비교 (발표자료 10쪽)"):
+        st.dataframe(R.strategy_compare(ctx, B), hide_index=True, use_container_width=True)
+        st.caption("전이위험(경계통행) = 경계 통행량(엣지전류) × 하류 확률 — 발표 정의. "
+                   "전이위험(하류통행) = 하류 구간 유동인구 × 확률 — 발표 10쪽 표의 수치. "
+                   "경사·통행량 기준은 값이 큰 순으로 예산이 찰 때까지 담는 그리디.")
+    sel_df = pd.DataFrame([{
+        "link_id": str(G.nodes[n].get("link_id") or n), "dong": G.nodes[n].get("dong"),
+        "length_m": G.nodes[n].get("length_m"), "slope_pct": ctx.slope[n],
+        "risk": round(ctx.risk[n], 3), "flow": ctx.flow[n],
+        "expected_slips": round(ctx.risk[n] * ctx.flow[n], 2),
+        "lon": G.nodes[n]["lon"], "lat": G.nodes[n]["lat"],
+    } for n in res["selected"]])
+    if len(sel_df):
+        sel_df = sel_df.sort_values("expected_slips", ascending=False)
+    with st.expander(f"선정 구간 {len(sel_df)}곳"):
+        st.dataframe(sel_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "선정 구간 CSV 내려받기", sel_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"selection_{gu}_B{B/1e8:.1f}억_d{delta:g}.csv", mime="text/csv",
+            key=f"{kp}_dl")
+
+
+def _budget_label(x, cur):
+    return (f"{x/1e8:,.2f}억" + (" (현행)" if abs(x - cur["spent_won"]) < 1 else
+                                 " (현행+30%)" if abs(x - 1.3 * cur["spent_won"]) < 1 else ""))
+
+
 if lvl == 2:
     with tabs[1]:
         st.latex(r"\max\ \sum_i risk_i\,flow_i\,x_i-\delta\!\!\sum_{(i,j)\in D}\! w_{ij}\,b_{ij}"
                  r"\quad\text{s.t.}\ \sum_i \ell_i\,c\,x_i\le B,\ \ b_{ij}\ge x_i-x_j")
-        p = st.columns([1, 1, 1, 1.4])
-        delta = p[0].number_input("δ (전이위험 가중치)", min_value=0.0, max_value=50.0,
-                                  value=1.0, step=0.5, key="delta",
-                                  help="0이면 경계를 무시(위험×통행량 최대화). 클수록 하류 경계를 강하게 피한다.")
-        h_new = p[1].number_input("경계 낙차 기준 h_min (m)", 0.5, 10.0, float(h_min), 0.5,
+        p = st.columns([1, 1, 1.6])
+        h_new = p[0].number_input("경계 낙차 기준 h_min (m)", 0.5, 10.0, float(h_min), 0.5,
                                   help="D = 인접하고 z_i − z_j ≥ h_min 인 쌍")
         if h_new != h_min:
             st.session_state["h_min"] = h_new
             st.rerun()
-        cost = p[2].number_input("미터당 설치비 (원)", 100_000, 5_000_000,
+        cost = p[1].number_input("미터당 설치비 (원)", 100_000, 5_000_000,
                                  int(round(M.COST_PER_M)), 10_000,
                                  help="기본 15억 원 / 1.7 km (3 m 1개 차로)")
-        wmode = p[3].selectbox(
+        wmode = p[2].selectbox(
             "전이 가중치 w_ij", ["current", "simple"],
             format_func={"current": "경계 통행량(엣지전류·MSA) × 하류 확률 — 발표 모형",
                          "simple": "하류 risk×flow (빠른 근사)"}.get)
         with st.expander("고급 설정"):
             a = st.columns(3)
-            iters = a[0].number_input("MSA 최대 반복", 1, 20, 8)
+            iters = a[0].number_input("MSA 최대 반복", 1, 40, 15)
             tlimit = a[1].number_input("MILP 시간 제한(초, 0=없음)", 0, 600,
                                        0 if av["golmok"] < 3000 else 30)
             n_src = a[2].number_input("엣지전류 source 상한 (0=전체)", 0, 5000,
@@ -435,155 +541,134 @@ if lvl == 2:
                                       else R.LARGE_REGION_N_SRC)
 
         ctx = _ctx(graph_key, h_min, float(cost), wmode, int(iters), float(tlimit), int(n_src))
-        ctx.cfg.delta = float(delta)
         cur = ctx.current
-
-        # 예산 격자
-        dflt = R.default_budgets(ctx, 16)
-        b = st.columns([1, 1, 1, 1.4])
-        bmin = b[0].number_input("예산 하한 (억)", 0.1, 10_000.0, round(dflt[0] / 1e8, 2), 0.5)
-        bmax = b[1].number_input("예산 상한 (억)", 0.2, 10_000.0, round(dflt[-1] / 1e8, 2), 0.5)
-        npts = b[2].number_input("격자 수", 3, 60, 16)
-        b[3].caption(
-            f"후보 {len(ctx.cand):,}개 · 전면 시공비 {ctx.full_cost/1e8:,.1f}억 · "
-            f"현행 골목 열선 {cur['length_m']:,.0f} m = **{cur['spent_won']/1e8:.2f}억** "
-            f"(격자에 현행·현행×1.3 포함)")
-        grid = [round(float(x), -6) for x in np.linspace(bmin * 1e8, bmax * 1e8, int(npts))]
-        if cur["spent_won"] > 0:   # 현행·현행+30% 는 반올림 없이 정확히 넣는다
-            grid += [x for x in (cur["spent_won"], 1.3 * cur["spent_won"])
-                     if bmin * 1e8 <= x <= bmax * 1e8]
-        grid = sorted(set(grid))
-
-        sweep_key = (graph_key, h_min, cost, wmode, iters, tlimit, n_src, float(delta), tuple(grid))
-        cached = st.session_state.get("sweep_key") == sweep_key
         auto = len(ctx.cand) <= 1500
-        run = st.button("예산 스윕 실행", type="primary", disabled=cached) or (auto and not cached)
-        if run:
-            bar = st.progress(0.0, text="MILP 풀이 중...")
-            df = R.sweep(ctx, grid, progress=lambda f, t: bar.progress(f, text=t))
-            bar.empty()
-            st.session_state["sweep_key"], st.session_state["sweep_df"] = sweep_key, df
-        if st.session_state.get("sweep_key") != sweep_key:
-            st.info("설정을 바꿨습니다. **예산 스윕 실행**을 누르면 예산별 해를 계산합니다.")
-            st.stop()
-        sw = st.session_state["sweep_df"]
+        st.caption(
+            f"후보 {len(ctx.cand):,}개 · 전면 시공비 {ctx.full_cost/1e8:,.1f}억 · "
+            f"현행 골목 열선 {cur['length_m']:,.0f} m = **{cur['spent_won']/1e8:.2f}억** · "
+            f"현행 경계 {cur['boundary']}곳, 하류 전이위험 {R._r1(cur['exposure_edge'])}")
+        base_key = (graph_key, h_min, cost, wmode, iters, tlimit, n_src)
+        tb, td = st.tabs(["예산 탐색 (δ 고정)", "δ 탐색 (예산 고정)"])
 
-        # 예산 슬라이더
-        opts = list(sw._B)
-        init = min(opts, key=lambda x: abs(x - cur["spent_won"])) if cur["spent_won"] else opts[len(opts) // 2]
-        B = st.select_slider(
-            "예산 — 드래그해서 예산별 배치를 본다", options=opts, value=init,
-            format_func=lambda x: f"{x/1e8:,.2f}억"
-                                  + (" (현행)" if abs(x - cur['spent_won']) < 1 else
-                                     " (현행+30%)" if abs(x - 1.3 * cur['spent_won']) < 1 else ""))
-        res = R.solve_budget(ctx, B)
-        res0 = R.solve_budget(ctx, B, 0.0)
+        # ── 예산 탐색 ───────────────────────────────────────────────
+        with tb:
+            dflt = R.default_budgets(ctx, 16)
+            b = st.columns([1, 1, 1, 1])
+            delta = b[0].number_input("δ (전이위험 가중치)", min_value=0.0, max_value=50.0,
+                                      value=1.0, step=0.5, key="delta",
+                                      help="0이면 경계를 무시(위험×통행량 최대화). 클수록 하류 경계를 강하게 피한다.")
+            bmin = b[1].number_input("예산 하한 (억)", 0.1, 10_000.0, round(dflt[0] / 1e8, 2), 0.5)
+            bmax = b[2].number_input("예산 상한 (억)", 0.2, 10_000.0, round(dflt[-1] / 1e8, 2), 0.5)
+            npts = b[3].number_input("격자 수", 3, 60, 16)
+            grid = [round(float(x), -6) for x in np.linspace(bmin * 1e8, bmax * 1e8, int(npts))]
+            if cur["spent_won"] > 0:   # 현행·현행+30% 는 반올림 없이 정확히 넣는다
+                grid += [x for x in (cur["spent_won"], 1.3 * cur["spent_won"])
+                         if bmin * 1e8 <= x <= bmax * 1e8]
+            grid = sorted(set(grid))
+            sweep_key = base_key + (float(delta), tuple(grid))
+            cached = st.session_state.get("sweep_key") == sweep_key
+            if st.button("예산 스윕 실행", type="primary", disabled=cached, key="run_b") or (auto and not cached):
+                bar = st.progress(0.0, text="MILP 풀이 중...")
+                df = R.sweep(ctx, grid, progress=lambda f, t: bar.progress(f, text=t))
+                bar.empty()
+                st.session_state["sweep_key"], st.session_state["sweep_df"] = sweep_key, df
+            if st.session_state.get("sweep_key") != sweep_key:
+                st.info("설정을 바꿨습니다. **예산 스윕 실행**을 누르면 예산별 해를 계산합니다.")
+            else:
+                sw = st.session_state["sweep_df"]
+                opts = list(sw._B)
+                init = min(opts, key=lambda x: abs(x - cur["spent_won"])) if cur["spent_won"] else opts[len(opts) // 2]
+                B = st.select_slider("예산 — 드래그해서 예산별 배치를 본다", options=opts, value=init,
+                                     format_func=lambda x: _budget_label(x, cur), key="B_slider")
+                _solution_view(ctx, R.solve_budget(ctx, B, float(delta)), R.solve_budget(ctx, B, 0.0),
+                               B, float(delta), "b")
 
-        mcol, scol = st.columns([1.75, 1])
-        with mcol:
-            sel, bnd = res["selected"], res["boundaries"]
-            exp_by_down = {}
-            for i, j in bnd:
-                exp_by_down[j] = exp_by_down.get(j, 0) + ctx.risk[j] * ctx.flow[j]
-            emax = max(exp_by_down.values(), default=1) or 1
-            show_cur = st.toggle("현행 열선 함께 표시", value=True)
-            layers = [
-                _dong_layer(polys, gu, dongs),
-                _path_layer(_paths(G, geom, list(G.nodes()), C_BG, 1), "bg"),
-            ]
-            if show_cur:
-                hn = [n for n in G.nodes() if G.nodes[n].get("heating_installed_precise")]
-                layers.append(_path_layer(_paths(G, geom, hn, C_HEAT, 4,
-                                                 lambda n: {"tag": "[현행 열선]"}), "heat"))
-            layers.append(_path_layer(_paths(
-                G, geom, sel, C_SEL, 5,
-                lambda n: {"tag": f"[선정] 기대방지 {ctx.risk[n]*ctx.flow[n]:.1f}건"}), "sel"))
-            if exp_by_down:
-                pts = pd.DataFrame([{"lon": G.nodes[j]["lon"], "lat": G.nodes[j]["lat"],
-                                     "e": e, "a": int(90 + 160 * e / emax),
-                                     "r": 3 + 7 * (e / emax) ** 0.5}
-                                    for j, e in exp_by_down.items()])
-                pts["c"] = pts.a.apply(lambda a: C_BND + [a])
-                layers.append(pdk.Layer("ScatterplotLayer", data=pts, id="rb",
-                                        get_position="[lon, lat]", get_radius="r",
-                                        radius_units='"pixels"', get_fill_color="c",
-                                        stroked=True, get_line_color=[255, 255, 255],
-                                        line_width_min_pixels=1, pickable=False))
-            st.pydeck_chart(_deck(G, layers), use_container_width=True)
-            st.caption("주황 = 선정 구간 · 파랑 = 현행 열선 · 빨간 원 = 잔여 경계의 하류(색이 진하고 클수록 하류 노출이 큼)")
+                st.markdown("##### 예산별 결과")
+                cols3 = [("경사위험방지", "경사위험 방지 (건)"), ("위험경계", "위험경계 (곳)"),
+                         ("전이위험_경계통행", "하류 전이위험")]
+                long = pd.concat([
+                    sw.assign(모형=f"제안 δ={delta:g}")[["예산억", "모형"] + [c for c, _ in cols3]],
+                    sw[["예산억"] + ["δ0_" + c for c, _ in cols3]]
+                      .rename(columns={"δ0_" + c: c for c, _ in cols3}).assign(모형="δ=0")
+                      [["예산억", "모형"] + [c for c, _ in cols3]],
+                ])
+                rule = alt.Chart(pd.DataFrame({"x": [B / 1e8]})).mark_rule(
+                    color="#2B3348", strokeDash=[4, 3]).encode(x="x:Q")
+                colr = alt.Color("모형:N", scale=alt.Scale(domain=[f"제안 δ={delta:g}", "δ=0"],
+                                                           range=["#E0674A", "#9AA5B4"]),
+                                 legend=alt.Legend(orient="top", title=None))
+                cc = st.columns(3)
+                for c_, (col, ttl) in zip(cc, cols3):
+                    base = alt.Chart(long).encode(
+                        x=alt.X("예산억:Q", title="예산 (억)"), y=alt.Y(f"{col}:Q", title=ttl),
+                        color=colr, tooltip=["모형", "예산억", col])
+                    c_.altair_chart((base.mark_line(strokeWidth=2) + base.mark_point(size=30, filled=True)
+                                     + rule).properties(height=220), use_container_width=True)
+                with st.expander("예산별 표"):
+                    st.dataframe(sw.drop(columns=["_B"]), hide_index=True, use_container_width=True)
 
-        with scol:
-            st.markdown(f"##### 예산 {B/1e8:,.2f}억 · δ={delta:g}")
-            m1, m2 = st.columns(2)
-            m1.metric("선정 구간", f"{res['n']}곳", f"{res['length_m']:,.0f} m", delta_color="off")
-            m2.metric("집행액", f"{res['spent_won']/1e8:,.2f}억",
-                      f"잔액 {(B-res['spent_won'])/1e8:,.2f}억", delta_color="off")
-            m1.metric("경사위험 방지 (기대 미끄러짐)", f"{res['benefit']:,.1f}건",
-                      f"현행 대비 {res['benefit']/cur['benefit']:.1f}배" if cur["benefit"] else None,
-                      delta_color="off")
-            m2.metric("위험 커버율", f"{res['coverage_risk_pct']:.1f}%",
-                      f"연장 커버 {res['coverage_len_pct']:.1f}%", delta_color="off")
-            m1.metric("위험경계", f"{res['boundary']}곳",
-                      f"{res['boundary']-res0['boundary']:+d} vs δ=0", delta_color="inverse")
-            m2.metric("하류 전이위험", f"{res['exposure']:,.1f}",
-                      f"{100*(res['exposure']/res0['exposure']-1):+.0f}% vs δ=0" if res0["exposure"] else None,
-                      delta_color="inverse")
-            loss = 100 * (1 - res["benefit"] / res0["benefit"]) if res0["benefit"] else 0
-            st.caption(f"δ=0 대비 편익 {loss:.1f}% 양보 · 건당 {res['won_per_slip']/1e4:,.0f}만원"
-                       if res["won_per_slip"] else "")
-            cmp = pd.DataFrame([
-                {"": "현행 실제", "구간": cur["n"], "편익": round(cur["benefit"], 1),
-                 "경계": cur["boundary"], "전이위험": round(cur["exposure"], 1)},
-                {"": "위험×통행 (δ=0)", "구간": res0["n"], "편익": round(res0["benefit"], 1),
-                 "경계": res0["boundary"], "전이위험": round(res0["exposure"], 1)},
-                {"": f"제안 (δ={delta:g})", "구간": res["n"], "편익": round(res["benefit"], 1),
-                 "경계": res["boundary"], "전이위험": round(res["exposure"], 1)},
-            ])
-            st.dataframe(cmp, hide_index=True, use_container_width=True)
-            if not res["converged"] and wmode == "current":
-                st.caption(f"MSA {iters}회 안에 고정점 미수렴 — 마지막 해를 표시")
-
-        # 예산 곡선
-        st.markdown("##### 예산별 결과")
-        long = pd.concat([
-            sw.assign(모형=f"제안 δ={delta:g}")[["예산억", "모형", "경사위험방지", "위험경계", "하류전이위험"]],
-            sw[["예산억", "δ0_경사위험방지", "δ0_위험경계", "δ0_하류전이위험"]]
-              .rename(columns={"δ0_경사위험방지": "경사위험방지", "δ0_위험경계": "위험경계",
-                               "δ0_하류전이위험": "하류전이위험"})
-              .assign(모형="δ=0")[["예산억", "모형", "경사위험방지", "위험경계", "하류전이위험"]],
-        ])
-        rule = alt.Chart(pd.DataFrame({"x": [B / 1e8]})).mark_rule(
-            color="#2B3348", strokeDash=[4, 3]).encode(x="x:Q")
-        colr = alt.Color("모형:N", scale=alt.Scale(domain=[f"제안 δ={delta:g}", "δ=0"],
-                                                   range=["#E0674A", "#9AA5B4"]),
-                         legend=alt.Legend(orient="top", title=None))
-        ch = []
-        for col, ttl in [("경사위험방지", "경사위험 방지 (건)"), ("위험경계", "위험경계 (곳)"),
-                         ("하류전이위험", "하류 전이위험")]:
-            base = alt.Chart(long).encode(
-                x=alt.X("예산억:Q", title="예산 (억)"), y=alt.Y(f"{col}:Q", title=ttl), color=colr,
-                tooltip=["모형", "예산억", col])
-            ch.append((base.mark_line(strokeWidth=2) + base.mark_point(size=30, filled=True) + rule)
-                      .properties(height=220))
-        cc = st.columns(3)
-        for c_, chart in zip(cc, ch):
-            c_.altair_chart(chart, use_container_width=True)
-        with st.expander("예산별 표"):
-            st.dataframe(sw.drop(columns=["_B"]), hide_index=True, use_container_width=True)
-
-        with st.expander("같은 예산, 선정 기준별 비교 (발표자료 10쪽)"):
-            st.dataframe(R.strategy_compare(ctx, B), hide_index=True, use_container_width=True)
-            st.caption("경사·통행량 기준은 해당 값이 큰 순으로 예산이 찰 때까지 담는 그리디.")
-
-        sel_df = pd.DataFrame([{
-            "link_id": str(G.nodes[n].get("link_id") or n), "dong": G.nodes[n].get("dong"),
-            "length_m": G.nodes[n].get("length_m"), "slope_pct": ctx.slope[n],
-            "risk": round(ctx.risk[n], 3), "flow": ctx.flow[n],
-            "expected_slips": round(ctx.risk[n] * ctx.flow[n], 2),
-            "lon": G.nodes[n]["lon"], "lat": G.nodes[n]["lat"],
-        } for n in res["selected"]]).sort_values("expected_slips", ascending=False)
-        with st.expander(f"선정 구간 {len(sel_df)}곳"):
-            st.dataframe(sel_df, hide_index=True, use_container_width=True)
-        st.download_button(
-            "⬇️ 선정 구간 CSV", sel_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"selection_{gu}_B{B/1e8:.1f}억_d{delta:g}.csv", mime="text/csv")
+        # ── δ 탐색 ─────────────────────────────────────────────────
+        with td:
+            st.caption("예산을 하나 고정하고 δ를 바꿔 가며 경사위험 방지(편익)와 하류 전이위험의 교환을 본다 "
+                       "(발표자료 11쪽의 한 예산선). 권장 δ = 편익 손실–전이위험 감소 곡선의 파레토 전환점.")
+            d0 = st.columns([1.2, 2])
+            bopts = sorted(set(R.default_budgets(ctx, 16)))
+            Bd = d0[0].select_slider("고정 예산", options=bopts,
+                                     value=min(bopts, key=lambda x: abs(x - cur["spent_won"])) if cur["spent_won"] else bopts[len(bopts)//2],
+                                     format_func=lambda x: _budget_label(x, cur), key="Bd")
+            dtxt = d0[1].text_input("δ 격자 (쉼표로 구분)", "0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 10, 12")
+            try:
+                dgrid = sorted({float(v) for v in dtxt.replace(" ", "").split(",") if v} | {0.0})
+            except ValueError:
+                st.error("δ 격자는 숫자를 쉼표로 구분해 적어 주세요.")
+                dgrid = [0.0, 1.0]
+            dkey = base_key + (float(Bd), tuple(dgrid))
+            dcached = st.session_state.get("dsweep_key") == dkey
+            if st.button("δ 스윕 실행", type="primary", disabled=dcached, key="run_d") or (auto and not dcached):
+                bar = st.progress(0.0, text="MILP 풀이 중...")
+                ddf = R.delta_sweep(ctx, Bd, dgrid, progress=lambda f, t: bar.progress(f, text=t))
+                bar.empty()
+                st.session_state["dsweep_key"], st.session_state["dsweep_df"] = dkey, ddf
+            if st.session_state.get("dsweep_key") != dkey:
+                st.info("설정을 바꿨습니다. **δ 스윕 실행**을 누르면 δ별 해를 계산합니다.")
+            else:
+                ddf = st.session_state["dsweep_df"]
+                metric = st.radio("전이위험 기준", ["경계통행", "하류통행"], horizontal=True,
+                                  format_func={"경계통행": "경계 통행량 × 하류 확률 (발표 정의)",
+                                               "하류통행": "하류 유동인구 × 확률 (발표 10쪽 표)"}.get,
+                                  key="d_metric")
+                ycol = f"감소%_{metric}"
+                knee = R.knee_delta(ddf, ycol)
+                ok = ddf[ddf["편익손실%"] <= 5.0]
+                upper = float(ok["δ"].max()) if len(ok) else None
+                k = st.columns(3)
+                k[0].metric("권장 δ (파레토 전환점, 하한)", f"{knee:g}" if knee is not None else "-")
+                k[1].metric("편익 5% 손실 이내 최대 δ (상한)", f"{upper:g}" if upper is not None else "-")
+                k[2].metric("현행 대비 (전환점 δ)",
+                            f"{float(ddf.loc[ddf['δ']==knee,'경사위험방지'].iloc[0])/cur['benefit']:.1f}배"
+                            if knee is not None and cur["benefit"] else "-")
+                dsel = st.select_slider("δ — 드래그해서 δ별 배치를 본다", options=list(ddf["δ"]),
+                                        value=knee if knee is not None else 0.0,
+                                        format_func=lambda v: f"{v:g}" + (" (전환점)" if v == knee else ""),
+                                        key="d_slider")
+                d = ddf.assign(권장=ddf["δ"] == knee, 선택=ddf["δ"] == dsel)
+                line = alt.Chart(d).mark_line(color="#E0674A", strokeWidth=2.5).encode(
+                    x=alt.X("편익손실%:Q", title="편익 손실 (%)"),
+                    y=alt.Y(f"{ycol}:Q", title="하류 전이위험 감소 (%)"))
+                pts = alt.Chart(d).mark_point(filled=True).encode(
+                    x="편익손실%:Q", y=f"{ycol}:Q",
+                    size=alt.condition(alt.datum.선택, alt.value(260), alt.value(70)),
+                    color=alt.condition(alt.datum.권장, alt.value("#C23B22"), alt.value("#E0674A")),
+                    tooltip=["δ", "선정", "경사위험방지", "편익손실%", "위험경계",
+                             "전이위험_경계통행", "전이위험_하류통행"])
+                lab = alt.Chart(d).mark_text(dy=-12, fontSize=11, color="#2B3348").encode(
+                    x="편익손실%:Q", y=f"{ycol}:Q", text=alt.Text("δ:Q", format="~g"))
+                five = alt.Chart(pd.DataFrame({"x": [5.0]})).mark_rule(
+                    color="#9AA5B4", strokeDash=[4, 3]).encode(x="x:Q")
+                st.altair_chart((line + pts + lab + five).properties(height=300), use_container_width=True)
+                st.caption("곡선이 가파른 구간은 편익을 조금만 양보해도 전이위험이 크게 준다. 진한 빨강 = 파레토 전환점, "
+                           "회색 점선 = 편익 5% 손실(발표의 δ 상한).")
+                _solution_view(ctx, R.solve_budget(ctx, Bd, float(dsel)), R.solve_budget(ctx, Bd, 0.0),
+                               Bd, float(dsel), "d", show_net_default=True)
+                with st.expander("δ별 표"):
+                    st.dataframe(ddf, hide_index=True, use_container_width=True)
