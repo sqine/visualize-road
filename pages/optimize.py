@@ -533,68 +533,34 @@ def _read_grid_upload(files) -> tuple[pd.DataFrame | None, dict]:
     return df, meta
 
 
-def _grid_howto():
-    with st.expander("스크립트로 직접 계산하기"):
+def _grid_other() -> tuple[pd.DataFrame | None, dict]:
+    """다른 지역·설정 — GitHub 스크립트 안내와 결과 파일 올리기."""
+    with st.expander("다른 지역이나 설정으로 계산하려면"):
         st.markdown(
-            "격자가 크면 앱 밖에서 계산합니다. 저장소를 내려받아 `streamlit_app` 폴더에서 아래 명령을 실행하면 "
-            "`data/` 폴더에 결과 파일(`sensitivity_grid.parquet`), 계산 조건(`.json`), 그림 보고서(`.html`)가 생깁니다. "
-            "보고서는 브라우저로 바로 열리고, parquet 파일은 이 탭의 '파일 올리기'로 올리면 칸을 골라 지도에서 배치를 볼 수 있습니다. "
-            "결과를 `data/`에 둔 채 앱을 실행하거나 저장소에 커밋하면 '사전계산 파일'로 자동으로 읽힙니다.")
-        st.code("python3 scripts/run_sensitivity_grid.py                        # 발표 대상지, 예산 20 × δ 13\n"
-                "python3 scripts/run_sensitivity_grid.py --budgets 60 --jobs 4  # 큰 격자, 4개 프로세스\n"
-                "python3 scripts/run_sensitivity_grid.py --gu 강북구 --dongs 수유1동,수유2동", language="bash")
+            "이 탭에 기본으로 나오는 결과는 발표 대상지(성북구 4개동)를 앱 기본 설정으로 미리 계산한 것입니다. "
+            "다른 행정동이나 다른 설정으로 보려면 저장소의 스크립트로 계산합니다. 저장소를 내려받아 "
+            "`streamlit_app` 폴더에서 실행하면 결과 파일(`.parquet`), 계산 조건(`.json`), 그림 보고서(`.html`)가 "
+            "만들어지며, 보고서는 브라우저에서 바로 열립니다. 자세한 사용법은 README 4.6절에 있습니다.")
+        st.code("python3 scripts/run_sensitivity_grid.py --gu 강북구 --dongs 수유1동,수유2동", language="bash")
         c = st.columns(2)
-        sp = APP_ROOT / R.GRID_SCRIPT
-        if sp.exists():
-            c[0].download_button("스크립트 내려받기", sp.read_bytes(), file_name=sp.name,
-                                 mime="text/x-python", use_container_width=True)
-        c[1].link_button("GitHub에서 보기", f"{REPO}/blob/main/{R.GRID_SCRIPT}", use_container_width=True)
-        st.caption("스크립트는 저장소의 utils/ 모듈을 함께 쓰므로 저장소 전체를 받은 상태에서 실행해야 합니다. "
-                   "앱에서 h_min·설치비·가중치·MSA 반복을 바꿨다면 같은 값을 옵션(--h-min, --cost, --weight, --msa)으로 넘깁니다.")
+        c[0].link_button("스크립트 보기 (GitHub)", f"{REPO}/blob/main/{R.GRID_SCRIPT}", use_container_width=True)
+        c[1].link_button("사용법 보기 (README)", f"{REPO}#readme", use_container_width=True)
+        ups = st.file_uploader("계산한 결과를 이 탭에서 보려면 .parquet와 .json을 함께 올립니다",
+                               type=["parquet", "json", "csv"], accept_multiple_files=True, key="g_up")
+    return _read_grid_upload(ups)
 
 
 def _grid_tab(ctx, cur, region_label):
     from utils import sensitivity_viz as V
     sig = R.grid_signature(ctx, region_label)
     st.caption("예산과 δ를 함께 바꿔 가며 경사위험 방지와 하류 전이위험의 교환을 봅니다(발표자료 11쪽). "
-               "칸 수가 많아 계산은 스크립트로 미리 하고, 이 탭은 결과를 읽어 그립니다.")
-    src = st.radio("결과 가져오기", ["사전계산 파일", "파일 올리기", "앱에서 작게 계산"], horizontal=True, key="g_src")
-    gdf, gmeta = None, {}
-    if src == "사전계산 파일":
-        if R.GRID_FILE.exists():
-            gdf, gmeta = _grid_file(R.GRID_FILE.stat().st_mtime)
-            gmeta = gmeta or {}
-        else:
-            st.info("`data/sensitivity_grid.parquet`이 없습니다. 아래 안내대로 스크립트를 실행하거나 결과 파일을 올려 주세요.")
-    elif src == "파일 올리기":
-        ups = st.file_uploader("sensitivity_grid.parquet (계산 조건 .json을 함께 올리면 조건을 확인합니다)",
-                               type=["parquet", "json", "csv"], accept_multiple_files=True, key="g_up")
-        gdf, gmeta = _read_grid_upload(ups)
-    else:
-        a = st.columns([1, 2, 1])
-        nb = a[0].number_input("예산 격자 수", 2, 12, 6, key="g_nb")
-        dtx = a[1].text_input("δ 격자", "0, 0.5, 1, 2, 4, 8", key="g_dt")
-        try:
-            dg = sorted({0.0, *(float(v) for v in dtx.replace(" ", "").split(",") if v)})
-        except ValueError:
-            st.error("δ 격자는 숫자를 쉼표로 구분해 적어 주세요."); dg = [0.0, 1.0]
-        base = R.default_budgets(ctx, int(nb))
-        bg = R.with_anchor_budgets([round(float(x), -6) for x in np.linspace(min(base), max(base), int(nb))],
-                                   cur["spent_won"])
-        a[2].metric("칸 수", f"{len(bg) * len(dg)}")
-        gkey = (tuple(sig.items()), tuple(bg), tuple(dg))
-        if st.button("이중 탐색 실행", type="primary", key="run_g",
-                     disabled=st.session_state.get("g_key") == gkey):
-            bar = st.progress(0.0, text="MILP 풀이 중...")
-            st.session_state["g_df"] = R.grid_sweep(ctx, bg, dg, progress=lambda f, t: bar.progress(f, text=t))
-            st.session_state["g_key"] = gkey
-            bar.empty()
-        if st.session_state.get("g_key") == gkey:
-            gdf, gmeta = st.session_state["g_df"], dict(sig)
-        else:
-            st.caption("칸 하나에 약 1초가 걸립니다. 수십 칸을 넘으면 스크립트를 권합니다.")
-    _grid_howto()
+               "칸마다 MILP를 풀어야 해서 결과는 미리 계산해 두었고, 이 탭은 그 결과를 읽어 그립니다.")
+    gdf, gmeta = _grid_other()
+    if gdf is None and R.GRID_FILE.exists():
+        gdf, gmeta = _grid_file(R.GRID_FILE.stat().st_mtime)
+        gmeta = gmeta or {}
     if gdf is None or not len(gdf):
+        st.info("미리 계산한 결과(data/sensitivity_grid.parquet)가 없습니다. 위 안내대로 스크립트로 계산해 주세요.")
         return
     need = {"_B", "δ", "경사위험방지", "편익손실%", "감소%_경계통행", "선정링크"}
     if need - set(gdf.columns):
