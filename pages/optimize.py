@@ -535,10 +535,10 @@ def _read_grid_upload(files) -> tuple[pd.DataFrame | None, dict]:
 
 def _grid_other() -> tuple[pd.DataFrame | None, dict]:
     """다른 지역·설정 — GitHub 스크립트 안내와 결과 파일 올리기."""
-    with st.expander("다른 지역이나 설정으로 계산하려면"):
+    with st.expander("스크립트로 계산하기 (GitHub)"):
         st.markdown(
             "이 탭에 기본으로 나오는 결과는 발표 대상지(성북구 4개동)를 앱 기본 설정으로 미리 계산한 것입니다. "
-            "다른 행정동이나 다른 설정으로 보려면 저장소의 스크립트로 계산합니다. 저장소를 내려받아 "
+            "칸이 수백 개를 넘는 큰 격자나 다른 행정동은 저장소의 스크립트로 계산하는 것이 편합니다. 저장소를 내려받아 "
             "`streamlit_app` 폴더에서 실행하면 결과 파일(`.parquet`), 계산 조건(`.json`), 그림 보고서(`.html`)가 "
             "만들어지며, 보고서는 브라우저에서 바로 열립니다. 자세한 사용법은 README 4.6절에 있습니다.")
         st.code("python3 scripts/run_sensitivity_grid.py --gu 강북구 --dongs 수유1동,수유2동", language="bash")
@@ -550,18 +550,67 @@ def _grid_other() -> tuple[pd.DataFrame | None, dict]:
     return _read_grid_upload(ups)
 
 
+def _grid_compute(ctx, cur, sig) -> pd.DataFrame | None:
+    """선택 기능 — 앱 안에서 직접 격자를 푼다. 결과는 이 브라우저 세션에만 남는다."""
+    with st.expander("앱에서 직접 계산하기 (선택)"):
+        st.markdown(
+            "기본 결과로 충분하면 쓸 필요가 없습니다. 지역이나 설정을 바꿔 기본 결과와 조건이 달라졌을 때, "
+            "스크립트를 돌리지 않고 이 자리에서 격자를 풀어 볼 수 있습니다. 칸 하나에 약 1초가 걸리며, "
+            "결과는 이 브라우저 세션에만 저장됩니다.")
+        a = st.columns([1, 2, 1])
+        nb = a[0].number_input("예산 격자 수", 2, 30, 8, key="g_nb")
+        dtx = a[1].text_input("δ 격자", "0, 0.5, 1, 1.5, 2, 3, 4, 7, 12", key="g_dt")
+        try:
+            dg = sorted({0.0, *(float(v) for v in dtx.replace(" ", "").split(",") if v)})
+        except ValueError:
+            st.error("δ 격자는 숫자를 쉼표로 구분해 적어 주세요."); dg = [0.0, 1.0]
+        base = R.default_budgets(ctx, int(nb))
+        bg = R.with_anchor_budgets([round(float(x), -6) for x in np.linspace(min(base), max(base), int(nb))],
+                                   cur["spent_won"])
+        n = len(bg) * len(dg)
+        a[2].metric("칸 수 (예상 시간)", f"{n} (약 {max(1, round(n * 0.9 / 60))}분)")
+        if n > 300:
+            st.warning("칸이 300개를 넘으면 화면에서 기다리기 길어집니다. 스크립트 사용을 권합니다.")
+        gkey = (tuple(sig.items()), tuple(bg), tuple(dg))
+        c = st.columns([1, 1, 2])
+        if c[0].button("격자 계산 실행", type="primary", key="run_g",
+                       disabled=st.session_state.get("g_key") == gkey):
+            bar = st.progress(0.0, text="MILP 풀이 중...")
+            st.session_state["g_df"] = R.grid_sweep(ctx, bg, dg, progress=lambda f, t: bar.progress(f, text=t))
+            st.session_state["g_key"], st.session_state["g_sig"] = gkey, sig
+            bar.empty()
+        if "g_df" in st.session_state and c[1].button("계산 결과 지우기", key="clr_g"):
+            for k in ("g_df", "g_key", "g_sig"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    if "g_df" in st.session_state and st.session_state.get("g_sig") == sig:
+        return st.session_state["g_df"]
+    return None
+
+
 def _grid_tab(ctx, cur, region_label):
     from utils import sensitivity_viz as V
     sig = R.grid_signature(ctx, region_label)
     st.caption("예산과 δ를 함께 바꿔 가며 경사위험 방지와 하류 전이위험의 교환을 봅니다(발표자료 11쪽). "
-               "칸마다 MILP를 풀어야 해서 결과는 미리 계산해 두었고, 이 탭은 그 결과를 읽어 그립니다.")
-    gdf, gmeta = _grid_other()
-    if gdf is None and R.GRID_FILE.exists():
-        gdf, gmeta = _grid_file(R.GRID_FILE.stat().st_mtime)
-        gmeta = gmeta or {}
+               "칸마다 MILP를 풀어야 해서 기본 결과는 미리 계산해 두었고, 이 탭은 그 결과를 읽어 그립니다.")
+    up_df, up_meta = _grid_other()
+    app_df = _grid_compute(ctx, cur, sig)
+    pre_df, pre_meta = (None, {})
+    if R.GRID_FILE.exists():
+        pre_df, pre_meta = _grid_file(R.GRID_FILE.stat().st_mtime)
+        pre_meta = pre_meta or {}
+    # 우선순위: 올린 파일 > 앱에서 계산한 결과(현재 조건) > 미리 계산한 결과
+    if up_df is not None:
+        gdf, gmeta, source = up_df, up_meta, "올린 파일"
+    elif app_df is not None:
+        gdf, gmeta, source = app_df, dict(sig), "앱에서 계산한 결과"
+    else:
+        gdf, gmeta, source = pre_df, pre_meta, "미리 계산한 결과"
     if gdf is None or not len(gdf):
-        st.info("미리 계산한 결과(data/sensitivity_grid.parquet)가 없습니다. 위 안내대로 스크립트로 계산해 주세요.")
+        st.info("미리 계산한 결과(data/sensitivity_grid.parquet)가 없습니다. 위의 '앱에서 직접 계산하기'를 쓰거나 "
+                "스크립트로 계산해 주세요.")
         return
+    st.caption(f"표시 중: **{source}**")
     need = {"_B", "δ", "경사위험방지", "편익손실%", "감소%_경계통행", "선정링크"}
     if need - set(gdf.columns):
         st.error("이중 탐색 결과 파일이 아닙니다 (빠진 열: " + ", ".join(sorted(need - set(gdf.columns))) + ").")
@@ -574,7 +623,8 @@ def _grid_tab(ctx, cur, region_label):
     elif diff:
         st.warning("결과 파일의 계산 조건이 현재 설정과 다릅니다: " +
                    ", ".join(f"{k} {gmeta[k]} ↔ {sig[k]}" for k in diff) +
-                   ". 그림은 파일 기준이며, 지도 배치는 같은 조건일 때만 표시합니다.")
+                   ". 그림은 파일 기준이며, 지도 배치는 같은 조건일 때만 표시합니다. "
+                   "현재 조건으로 보려면 위의 '앱에서 직접 계산하기'를 쓰면 됩니다.")
     elif gmeta.get("created"):
         st.caption(f"계산 조건 일치 · {gmeta.get('created')} 계산 · {gmeta.get('cells', len(gdf))}칸")
 
